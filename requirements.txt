@@ -1,0 +1,7 @@
+# Core dependencies
+fastcdc>=1.5.0
+zstandard>=0.21.0
+rich>=13.0.0
+
+# Testing
+pytest>=7.0.0
