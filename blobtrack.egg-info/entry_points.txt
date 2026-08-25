@@ -1,0 +1,2 @@
+[console_scripts]
+blobtrack = blobtrack.cli.main:main
