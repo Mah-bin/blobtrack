@@ -9,9 +9,10 @@
 ================================================================================
 
 MODULE OVERVIEW:
-    This module provides two hashing capabilities:
-    1. hash_bytes()          — Hash raw bytes in memory (for individual chunks)
-    2. hash_file_streaming() — Hash an entire file from disk without loading it into RAM
+    This module provides SHA-256 hashing capabilities:
+    1. hash_bytes()            — Hash raw bytes in memory (for individual chunks)
+    2. hash_file_streaming()   — Hash an entire file from disk without loading it into RAM
+    3. hash_chunks_from_stream() — Hash chunks from a generator stream using a thread pool
 
     All hashing uses SHA-256, the same algorithm that secures Bitcoin and HTTPS.
     The probability of two different inputs producing the same hash is 1 in 2^256,
@@ -23,52 +24,38 @@ CONSTANT: STREAM_BUFFER_SIZE = 64 MB
 
 FUNCTION: hash_bytes(data: bytes) -> str
     Compute the SHA-256 hash of a raw byte sequence.
-    
     Args:
         data: The raw bytes to fingerprint.
     Returns:
         A 64-character lowercase hexadecimal string (the SHA-256 digest).
-    Example:
-        >>> hash_bytes(b"hello world")
-        'b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9'
 
 FUNCTION: hash_file_streaming(filepath: str) -> str
     Compute the SHA-256 hash of an entire file by streaming it from disk
     in 64 MB buffers. This ensures the file is NEVER fully loaded into RAM,
     making it safe to hash files of any size (even 500 GB+).
-
     Args:
         filepath: Absolute or relative path to the file.
     Returns:
         A 64-character lowercase hexadecimal string.
-    Example:
-        >>> hash_file_streaming("massive_video.mp4")
-        'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
 
-FUNCTION: hash_chunks_parallel(chunks_data, max_workers=8) -> List[Tuple[int, str]]
-    Hash multiple chunks in parallel using a thread pool.
+FUNCTION: hash_chunks_from_stream(chunk_stream: Generator, max_workers=8) -> List[Tuple[int, str]]
+    Hash chunks from a generator stream using a thread pool.
 
-    Each chunk is hashed on a separate CPU thread simultaneously, dramatically
-    speeding up the fingerprinting of thousands of chunks from a large file.
+    CRITICAL DESIGN DECISION:
+        The previous version (hash_chunks_parallel) required a fully populated
+        List[Tuple[int, bytes]] as input. This forced the caller to buffer
+        gigabytes of chunk data into memory before hashing could begin.
+
+        This new version consumes a generator (from chunk_file_streaming),
+        submitting hashing jobs to the thread pool as chunks arrive one-by-one
+        from the stream. Each chunk is processed and discarded immediately,
+        keeping memory usage flat regardless of file size.
 
     Args:
-        chunks_data: A list of (chunk_index, raw_bytes) tuples.
+        chunk_stream: A generator yielding ChunkData objects (from chunker.py).
         max_workers: Maximum number of concurrent threads (default: 8).
     Returns:
         A list of (chunk_index, sha256_hex_string) tuples, sorted by index.
-    Example:
-        >>> data = [(0, b"chunk0"), (1, b"chunk1"), (2, b"chunk2")]
-        >>> results = hash_chunks_parallel(data, max_workers=4)
-        >>> len(results)
-        3
-
-    INTERNAL LOGIC:
-        - "Submit all hashing jobs to the thread pool" — Each chunk is sent to a
-          separate thread via ThreadPoolExecutor.submit().
-        - "Collect results as they complete" — as_completed() yields futures as
-          threads finish, regardless of submission order.
-        - "Sort by original chunk index to maintain file order" — Results are
-          re-sorted by chunk index because threads finish in unpredictable order.
 
 
 ================================================================================
@@ -96,82 +83,68 @@ MODULE OVERVIEW:
         - Average: 2 MB    (the target size for most chunks)
         - Maximum: 8 MB    (prevents a single chunk from getting too large)
 
+    ARCHITECTURE (v2 — MEMORY-SAFE):
+        The original chunk_file() function loaded all chunk data bytes into
+        an in-memory list. A 20GB file would instantly crash the tool (OOM).
+
+        The redesigned architecture separates metadata from data:
+        - ChunkMeta: Lightweight object (index, offset, length, hash). Safe to
+          collect thousands of these in a list — uses negligible RAM.
+        - ChunkData: Heavy object (meta + raw bytes). Only exists momentarily
+          inside the streaming generator, then is garbage-collected.
+
+        The original _read_chunk_data() helper opened and closed the file for
+        every single chunk, causing disk thrashing on thousands of chunks.
+        The new design keeps a single file handle open for the entire chunking
+        operation using a `with open()` context manager.
+
 CONSTANTS:
     MIN_CHUNK_SIZE = 512 * 1024        (512 KB)
     AVG_CHUNK_SIZE = 2 * 1024 * 1024   (2 MB)
     MAX_CHUNK_SIZE = 8 * 1024 * 1024   (8 MB)
 
-CLASS: Chunk
-    Represents a single chunk produced by the CDC engine.
-
+CLASS: ChunkMeta
+    Lightweight metadata for a single chunk. Does NOT hold raw data bytes.
+    Safe to collect thousands of these in a list without memory issues.
     Attributes:
         index:      The chunk's position in the file (0-based).
         offset:     The byte offset where this chunk starts in the original file.
         length:     The length of this chunk in bytes.
         hash:       The SHA-256 fingerprint of this chunk's raw data.
+
+CLASS: ChunkData
+    Heavy object containing both metadata and raw bytes.
+    Should only exist momentarily inside a streaming generator.
+    Attributes:
+        meta:       A ChunkMeta object.
         data:       The raw (uncompressed) bytes of this chunk.
 
-FUNCTION: chunk_file(filepath: str) -> List[Chunk]
-    Slice a file into variable-sized chunks using Content-Defined Chunking (CDC).
-
-    The file is streamed from disk — it is NEVER fully loaded into RAM.
-    The fastcdc library handles the rolling hash math internally, scanning
-    the bytes and cutting whenever it finds the target mathematical pattern.
-
-    Each chunk is then fingerprinted with SHA-256.
-
-    Args:
-        filepath: Path to the file to chunk.
-    Returns:
-        An ordered list of Chunk objects representing the entire file.
-    Raises:
-        FileNotFoundError: If the file does not exist.
-        ValueError: If the file is empty.
-    Example:
-        >>> chunks = chunk_file("massive_video.mp4")
-        >>> print(f"File split into {len(chunks)} chunks")
-        File split into 5127 chunks
-
-    INTERNAL LOGIC:
-        - "fastcdc reads the file in a streaming fashion and yields chunk
-          boundaries." — The fastcdc library handles the Rolling Hash math.
-          Each yielded object contains: offset, length, and the data bytes.
-        - "Read the raw bytes for this chunk from the file" — Uses _read_chunk_data()
-          which seeks directly to the byte offset on disk.
-        - "Fingerprint the chunk with SHA-256" — Calls hash_bytes() from hasher.py.
-
-FUNCTION: chunk_file_streaming(filepath: str) -> Generator[Chunk, None, None]
-    A memory-efficient generator version of chunk_file().
-
-    Instead of building the entire list of chunks in memory, this yields
-    one chunk at a time. This is critical for extremely large files (50GB+)
-    where even holding all chunk metadata in a list could use significant RAM.
-
-    The caller processes and stores each chunk immediately, then the chunk's
-    data is garbage-collected before the next chunk is yielded.
-
+FUNCTION: chunk_file_streaming(filepath: str) -> Generator[ChunkData, None, None]
+    The primary chunking function. Yields one ChunkData at a time.
+    Only one chunk's worth of raw bytes exists in RAM at any given moment.
+    The file handle is kept open for the entire operation (single open/close).
     Args:
         filepath: Path to the file to chunk.
     Yields:
-        Chunk objects, one at a time, in file order.
-    Example:
-        >>> for chunk in chunk_file_streaming("huge_dataset.csv"):
-        ...     store_chunk(chunk)
+        ChunkData objects, one at a time, in file order.
+    Raises:
+        FileNotFoundError: If the file does not exist.
+        ValueError: If the file is empty.
 
-FUNCTION: get_file_info(filepath: str) -> dict
-    Get basic file information before chunking.
-
+FUNCTION: chunk_file_metadata_only(filepath: str) -> List[ChunkMeta]
+    Chunks the file but only returns lightweight metadata (no raw bytes stored).
+    Safe to call on files of any size because ChunkMeta objects are tiny.
+    Used when you need the list of chunk hashes (e.g., for building a Merkle Tree)
+    without holding the actual data in memory.
     Args:
-        filepath: Path to the file.
+        filepath: Path to the file to chunk.
     Returns:
-        A dictionary containing filename, size in bytes, and human-readable size.
+        An ordered list of ChunkMeta objects.
 
-FUNCTION: _read_chunk_data(filepath, offset, length) -> bytes  [PRIVATE]
+FUNCTION: read_chunk_at(filepath, offset, length) -> bytes
     Read a specific byte range from a file on disk.
-
-    This uses seek() to jump directly to the chunk's starting position
-    without reading any data before it, making it extremely fast.
-
+    Uses seek() to jump directly to the chunk's starting position.
+    Used during file reconstruction to fetch individual chunks on demand.
     Args:
         filepath: Path to the file.
         offset:   Byte position to start reading from.
@@ -179,14 +152,10 @@ FUNCTION: _read_chunk_data(filepath, offset, length) -> bytes  [PRIVATE]
     Returns:
         The raw bytes for this chunk.
 
-FUNCTION: _human_readable_size(size_bytes: int) -> str  [PRIVATE]
-    Convert a byte count to a human-readable string.
-
-    Example:
-        >>> _human_readable_size(1048576)
-        '1.00 MB'
-        >>> _human_readable_size(5368709120)
-        '5.00 GB'
+FUNCTION: get_file_info(filepath: str) -> dict
+    Get basic file information before chunking.
+    Returns:
+        A dictionary containing filename, size in bytes, and human-readable size.
 
 
 ================================================================================
@@ -205,35 +174,26 @@ MODULE OVERVIEW:
     This means a 4 MB chunk might shrink to 1-2 MB on disk, further
     reducing storage requirements on top of the deduplication savings.
 
+    NOTE: Compression is NOT called during chunking. It is called by the
+    Storage Layer (local_store.py) when saving chunks to disk. This keeps
+    the chunker focused solely on slicing and hashing.
+
 CONSTANT: DEFAULT_COMPRESSION_LEVEL = 3
-    Compression level: 3 is the default sweet spot.
     Level 1 = fastest but least compression.
     Level 22 = slowest but maximum compression.
     Level 3 = excellent balance of speed and compression ratio.
 
 FUNCTION: compress(data: bytes, level: int = 3) -> bytes
     Compress raw bytes using Zstandard.
-
     Args:
         data: The raw bytes to compress (e.g., a single chunk's content).
         level: Compression level (1-22). Default is 3.
     Returns:
         The compressed bytes.
-    Example:
-        >>> original = b"A" * 1000000  # 1 MB of repeated data
-        >>> compressed = compress(original)
-        >>> len(compressed) < len(original)
-        True
 
 FUNCTION: decompress(data: bytes) -> bytes
     Decompress Zstandard-compressed bytes back to the original raw data.
-
     Args:
         data: The compressed bytes to decompress.
     Returns:
         The original raw bytes.
-    Example:
-        >>> original = b"Hello, World!" * 1000
-        >>> compressed = compress(original)
-        >>> decompress(compressed) == original
-        True

@@ -1,8 +1,26 @@
 import hashlib
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import List, Tuple
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from typing import Generator
+
+from blobtrack.core.packer import compress
 
 STREAM_BUFFER_SIZE = 64 * 1024 * 1024
+
+
+@dataclass
+class ProcessedChunk:
+    index: int
+    offset: int
+    length: int
+    hash: str
+    compressed_data: bytes
+
+    def __repr__(self) -> str:
+        return (
+            f"ProcessedChunk(index={self.index}, offset={self.offset}, "
+            f"length={self.length}, hash={self.hash[:12]}...)"
+        )
 
 
 def hash_bytes(data: bytes) -> str:
@@ -22,19 +40,37 @@ def hash_file_streaming(filepath: str) -> str:
     return sha256.hexdigest()
 
 
-def hash_chunks_parallel(chunks_data: List[Tuple[int, bytes]], max_workers: int = 8) -> List[Tuple[int, str]]:
-    results: List[Tuple[int, str]] = []
+def _process_single_chunk(chunk_data) -> ProcessedChunk:
+    chunk_hash = hash_bytes(chunk_data.data)
+    compressed = compress(chunk_data.data)
 
+    return ProcessedChunk(
+        index=chunk_data.index,
+        offset=chunk_data.offset,
+        length=chunk_data.length,
+        hash=chunk_hash,
+        compressed_data=compressed,
+    )
+
+
+def process_chunks(
+    chunk_stream: Generator,
+    batch_size: int = 16,
+    max_workers: int = 8,
+) -> Generator[ProcessedChunk, None, None]:
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_index = {
-            executor.submit(hash_bytes, data): index
-            for index, data in chunks_data
-        }
+        batch = []
 
-        for future in as_completed(future_to_index):
-            index = future_to_index[future]
-            chunk_hash = future.result()
-            results.append((index, chunk_hash))
+        for chunk in chunk_stream:
+            batch.append(chunk)
 
-    results.sort(key=lambda x: x[0])
-    return results
+            if len(batch) >= batch_size:
+                futures = [executor.submit(_process_single_chunk, c) for c in batch]
+                for future in futures:
+                    yield future.result()
+                batch = []
+
+        if batch:
+            futures = [executor.submit(_process_single_chunk, c) for c in batch]
+            for future in futures:
+                yield future.result()
