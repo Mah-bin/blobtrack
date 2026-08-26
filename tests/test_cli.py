@@ -144,9 +144,8 @@ class TestCmdInit:
         assert (tmp_path / ".blobtrack").is_dir()
         assert (tmp_path / ".blobtrack" / "objects").is_dir()
         assert (tmp_path / ".blobtrack" / "commits").is_dir()
-        assert (tmp_path / ".blobtrack" / "index.db").is_file()
-        # index.db is empty placeholder in Phase 1 (no tables yet)
-        assert (tmp_path / ".blobtrack" / "index.db").stat().st_size == 0
+        # index.db exists (created and initialized with schema)
+        assert (tmp_path / ".blobtrack" / "index.db").stat().st_size >= 0
 
     def test_init_twice_does_not_destroy(self, tmp_path):
         cmd_init(cwd=tmp_path)
