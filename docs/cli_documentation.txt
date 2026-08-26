@@ -1,0 +1,180 @@
+================================================================================
+ BLOBTRACK — CLI DOCUMENTATION
+ Content-Aware Binary Version Control System
+================================================================================
+
+
+================================================================================
+ FILE: main.py — CLI Entry Point (argparse front door)
+================================================================================
+
+MODULE OVERVIEW:
+    This is the front door of the entire application. When a user types
+    "blobtrack <command>" in their terminal, this file receives the input,
+    parses it using Python's argparse library, and routes it to the
+    correct handler function in commands.py.
+
+    Member 1 - CLI & Integration Lead
+    Phase 1: registers all 8 commands, dispatches to commands.py.
+    Future commands (add/commit/log/etc) are parsed but stubbed until
+    later increments are delivered by other team members.
+
+FUNCTION: build_parser() -> argparse.ArgumentParser
+    Constructs the argument parser with all 8 subcommands.
+
+    Global Arguments:
+        --version       Prints "blobtrack 0.1.0" and exits.
+        --help          Prints the help menu listing all commands.
+
+    Subcommands Registered:
+        init            No arguments required.
+                        Creates a new blobtrack repository.
+
+        add <filepath>  Requires 1 positional argument: the file path.
+                        Chunks, hashes, and stages the file.
+
+        commit -m MSG   Requires -m/--message flag with a string.
+                        Saves a snapshot of all staged files.
+
+        log             No arguments required.
+                        Displays the chronological commit history.
+
+        checkout HASH   Requires 1 positional argument: the commit hash.
+                        Reconstructs and restores a previous version.
+
+        push [remote]   Optional positional argument (default: "origin").
+                        Pushes only new/modified chunks to the remote.
+
+        pull [remote]   Optional positional argument (default: "origin").
+                        Pulls only missing chunks from the remote.
+
+        gc              No arguments required.
+                        Deletes orphan chunks with zero references.
+
+    Design Decision: "required=True" on subparsers
+        This forces the user to type a command. Running bare "blobtrack"
+        with no command will print an error instead of silently doing nothing.
+
+    Design Decision: "nargs='?' with default='origin'" on push/pull
+        This mirrors Git's UX convention where "git push" defaults to
+        "origin" if no remote name is specified.
+
+FUNCTION: main() -> None
+    The main execution function. Called when the user runs blobtrack.
+
+    Flow:
+        1. Calls build_parser() to create the argument parser.
+        2. Calls parser.parse_args() to parse the user's terminal input.
+        3. Routes to the correct cmd_* function in commands.py based on
+           the "cmd" attribute set by argparse subparsers.
+        4. Wraps everything in a try/except block:
+           - SystemExit is re-raised (so argparse --help and --version
+             can exit cleanly).
+           - All other exceptions are caught, printed to stderr, and
+             the process exits with code 1.
+
+    Entry Point Registration:
+        This function is registered as "blobtrack" in setup.py via:
+            entry_points={"console_scripts": ["blobtrack=blobtrack.cli.main:main"]}
+        This allows the user to type "blobtrack" directly in the terminal
+        after installing the package with "pip install -e ."
+
+
+================================================================================
+ FILE: commands.py — CLI Command Handlers (Integration Layer)
+================================================================================
+
+MODULE OVERVIEW:
+    This file contains the actual logic for each CLI command. main.py
+    parses the user's input and calls the appropriate function here.
+
+    Member 1 - CLI & Integration Lead
+    Phase 1: cmd_init() fully implemented. All other commands are
+    controlled placeholders that print "not available yet" messages
+    until Members 2/3/4 deliver their modules in later increments.
+
+HELPER: _print_success(msg: str) -> None
+    Prints a green success message using the Rich library.
+    If Rich is not installed, falls back to plain print().
+
+    Design Decision: Rich Fallback
+        The CLI uses a try/except ImportError guard around Rich.
+        If Rich is not available (e.g., in a minimal Docker container),
+        the tool still works perfectly with plain text output. This
+        prevents a hard dependency crash on a cosmetic library.
+
+HELPER: _print_error(msg: str) -> None
+    Prints a red error message using the Rich library.
+    Falls back to printing to sys.stderr if Rich is unavailable.
+
+FUNCTION: cmd_init(cwd: pathlib.Path | None = None) -> None
+    Creates a new blobtrack repository in the current working directory.
+
+    What it creates:
+        .blobtrack/             Hidden root directory (like .git/)
+        .blobtrack/objects/     Stores compressed chunk blobs named by SHA-256 hash
+        .blobtrack/commits/     Stores JSON commit manifests
+        .blobtrack/index.db     SQLite metadata database
+
+    Safety Features:
+        - Double Init Protection: If .blobtrack/ already exists, the command
+          refuses to run and prints an error. It will never overwrite or
+          corrupt an existing repository.
+
+        - Directory Validation: Checks that the current path is actually a
+          directory before attempting to create the repository.
+
+        - Atomic Rollback: If any step fails (e.g., permission denied on
+          creating a subdirectory), the entire partially-created .blobtrack/
+          folder is deleted via shutil.rmtree(). The user is never left with
+          a half-initialized, broken repository.
+
+        - Permission Hardening: Directories are created with mode 0o700
+          (owner read/write/execute only). On Windows this is silently
+          ignored but does not cause an error.
+
+    Member 4 Integration:
+        The function attempts to import init_db() from blobtrack.storage.index_db.
+        If Member 4's storage module exists, it delegates database schema creation
+        to init_db(). If Member 4's module is not yet available (ImportError),
+        it creates an empty placeholder index.db file instead.
+
+    Args:
+        cwd: Optional path override. If None, uses the current working directory.
+             This parameter exists primarily for testing purposes.
+
+FUNCTION: cmd_add(filepath: str) -> None
+    STUB — Increment 2.
+    Will be implemented when the storage layer (Member 4) is available.
+    Currently prints: "add functionality is not available yet"
+
+FUNCTION: cmd_commit(message: str) -> None
+    STUB — Increment 3.
+    Will be implemented when Merkle Tree (Member 3) and storage (Member 4)
+    are available.
+    Currently prints: "commit functionality is not available yet"
+
+FUNCTION: cmd_log() -> None
+    STUB — Increment 4.
+    Will be implemented when the storage layer is available.
+    Currently prints: "log functionality is not available yet"
+
+FUNCTION: cmd_checkout(commit_hash: str) -> None
+    STUB — Increment 4.
+    Will be implemented when the storage layer is available.
+    Currently prints: "checkout functionality is not available yet"
+
+FUNCTION: cmd_push(remote: str) -> None
+    STUB — Increment 5.
+    Will be implemented when remote sync (Member 4) is available.
+    Currently prints: "push functionality is not available yet"
+
+FUNCTION: cmd_pull(remote: str) -> None
+    STUB — Increment 5.
+    Will be implemented when remote sync (Member 4) is available.
+    Currently prints: "pull functionality is not available yet"
+
+FUNCTION: cmd_gc() -> None
+    STUB — Increment 4.
+    Will be implemented when the storage layer is available.
+    Currently prints: "gc functionality is not available yet"

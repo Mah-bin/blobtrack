@@ -1,18 +1,5 @@
-# Byte-compiled / optimized / DLL files
-__pycache__/
-*.py[cod]
-*$py.class
-
-# Distribution / packaging
-build/
-dist/
 *.egg-info/
-.eggs/
-
-# Testing & Virtual Environments
+__pycache__/
+*.pyc
 .pytest_cache/
-.coverage
-htmlcov/
-venv/
-.venv/
-env/
+.blobtrack/
