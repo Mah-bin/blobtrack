@@ -197,3 +197,167 @@ FUNCTION: decompress(data: bytes) -> bytes
         data: The compressed bytes to decompress.
     Returns:
         The original raw bytes.
+
+
+================================================================================
+ FILE: merkle_tree.py — Merkle Tree Construction & Serialization
+================================================================================
+
+MODULE OVERVIEW:
+    A Merkle Tree lets us represent the entire fingerprint-state of a file
+    as a single root hash. If two files (or two versions of the same file)
+    produce the same root hash, they are guaranteed to be identical at the
+    chunk level. If the root hashes differ, walking down the tree lets us
+    prune away any subtree whose hash matches on both sides, so we only
+    pay attention to the parts of the file that actually changed.
+
+    The tree is built bottom-up from the ordered list of chunk hashes
+    produced by the chunking and hashing pipeline (Member 2).
+
+CLASS: MerkleNode
+    A single node in the Merkle Tree.
+
+    Uses __slots__ for memory efficiency — reduces per-node memory footprint,
+    which matters for deep trees built from files with thousands of chunks.
+
+    Attributes:
+        hash:       The SHA-256 fingerprint of this node.
+                    For leaf nodes: the chunk's hash directly from the hasher.
+                    For internal nodes: SHA-256 of left.hash + right.hash concatenated.
+        left:       Left child MerkleNode (None for leaf nodes).
+        right:      Right child MerkleNode (None for leaf nodes).
+        is_leaf:    True if this node represents a chunk (bottom of tree).
+                    False if this is an internal node.
+
+    Equality:
+        Two MerkleNodes are equal if their hash and is_leaf attributes match.
+
+FUNCTION: _combine_hashes(left_hash: str, right_hash: str) -> str  [PRIVATE]
+    Hashes two child hashes together to produce their parent's hash.
+    Concatenates the two hex strings, encodes to UTF-8, and runs SHA-256.
+    This is the standard cryptographic method for building internal Merkle nodes.
+
+FUNCTION: build_tree(chunk_hashes: List[str]) -> Optional[MerkleNode]
+    Builds a Merkle Tree bottom-up from an ordered list of chunk fingerprints.
+
+    Args:
+        chunk_hashes: SHA-256 hex digests, one per chunk, in file order.
+    Returns:
+        The root MerkleNode, or None if chunk_hashes is empty.
+
+    Odd-Number Handling:
+        If a level has an odd number of nodes, the leftover node is carried
+        up untouched to the next level (PROMOTED, not duplicated). Duplicating
+        the node would make its chunk hash appear twice in collect_leaf_hashes(),
+        silently corrupting the chunk list. Promotion keeps every chunk hash
+        represented exactly once no matter how the tree balances.
+
+    Special Cases:
+        - Empty list returns None.
+        - Single chunk returns that chunk as a leaf node (it is its own root).
+
+    Algorithm:
+        1. Create leaf nodes from chunk hashes (Level 0).
+        2. While more than 1 node remains:
+           a. Pair adjacent nodes left-to-right.
+           b. Combine each pair's hashes to create a parent node.
+           c. If a node has no partner (odd one out), promote it as-is.
+        3. Return the final remaining node as root.
+
+FUNCTION: serialize_tree(root: Optional[MerkleNode]) -> str
+    Serializes a Merkle Tree to a JSON string for storage on disk.
+    Recursively converts each node to a dictionary with keys:
+    "hash", "is_leaf", "left", "right".
+    Args:
+        root: The root MerkleNode to serialize.
+    Returns:
+        A JSON string representation of the entire tree.
+
+FUNCTION: deserialize_tree(data: str) -> Optional[MerkleNode]
+    Reconstructs a Merkle Tree from a JSON string produced by serialize_tree().
+    Recursively rebuilds MerkleNode objects from the dictionary structure.
+    Args:
+        data: A JSON string from serialize_tree().
+    Returns:
+        The root MerkleNode, or None if the JSON represents a null tree.
+
+FUNCTION: collect_leaf_hashes(root: Optional[MerkleNode]) -> List[str]
+    Returns every leaf (chunk) hash under this node, left-to-right in order.
+    This is the "recipe" — the ordered list of chunk hashes needed to
+    reconstruct the original file.
+    Args:
+        root: The root MerkleNode to collect from.
+    Returns:
+        Ordered list of chunk hash strings. Empty list if root is None.
+
+
+================================================================================
+ FILE: differ.py — Delta Diffing Between Two Merkle Trees
+================================================================================
+
+MODULE OVERVIEW:
+    Given the Merkle Tree of a file's previous commit and the tree of its
+    current state, these functions tell the rest of the system exactly which
+    chunks are new, which are gone, and which are unchanged — so the storage
+    and remote sync layers only have to push/pull the handful of chunks that
+    actually changed.
+
+    Two diffing strategies are provided:
+    1. compute_delta()        — Positional (structural) tree walk. Fast.
+    2. compute_delta_by_set() — Content-based set comparison. Accurate.
+
+FUNCTION: compute_delta(old_tree, new_tree) -> Dict[str, List[str]]
+    Top-down structural diff between two Merkle Trees.
+
+    Walks both trees in lockstep, position by position. Whenever the hash
+    at the current position matches on both sides, the whole subtree is
+    pruned (a matching hash proves every chunk underneath is identical).
+    This is what makes diffing a 20GB file fast: we only ever look at the
+    branches that actually changed.
+
+    Args:
+        old_tree: Root MerkleNode of the previous version (or None).
+        new_tree: Root MerkleNode of the current version (or None).
+    Returns:
+        {"added": [...], "removed": [...], "unchanged": [...]}
+        Each list holds chunk hashes (hex digests).
+
+    Algorithm (_walk recursive function):
+        - Both None: return (nothing to compare).
+        - Old is None: all chunks under new_tree are "added".
+        - New is None: all chunks under old_tree are "removed".
+        - Hashes match: entire subtree is "unchanged" (prune — don't recurse).
+        - Hashes differ and either is a leaf: old chunk is "removed", new is "added".
+        - Hashes differ, both internal: recurse into left and right children.
+
+    Caveat:
+        This positional walk assumes the two trees have roughly the same
+        shape, which holds for most in-place edits. If chunks are inserted
+        or removed in a way that shifts everything after them, a positional
+        comparison can under-count how much content is actually shared.
+        For that scenario, use compute_delta_by_set() instead.
+
+FUNCTION: compute_delta_by_set(old_tree, new_tree) -> Dict[str, List[str]]
+    Content-based (position-independent) diff between two Merkle Trees.
+
+    Collects the full set of leaf hashes on each side and compares them
+    with set arithmetic instead of walking the trees in lockstep.
+
+    This is the version that should drive push()/pull() in remote_sync.py:
+    content-defined chunking means a chunk can shift position in the tree
+    (e.g., something was inserted earlier in the file) without its own
+    content changing at all. A positional walk would wrongly flag every
+    chunk after the insertion point as "changed"; set comparison correctly
+    recognizes them as already-stored content that never needs re-uploading.
+
+    Args:
+        old_tree: Root MerkleNode of the previous version (or None).
+        new_tree: Root MerkleNode of the current version (or None).
+    Returns:
+        {"added": [...], "removed": [...], "unchanged": [...]}
+        Lists are sorted for deterministic output.
+
+    Set Operations:
+        - added    = new_hashes - old_hashes  (chunks only in the new version)
+        - removed  = old_hashes - new_hashes  (chunks only in the old version)
+        - unchanged = old_hashes & new_hashes (chunks present in both versions)
