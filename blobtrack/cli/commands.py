@@ -178,6 +178,9 @@ def cmd_add(filepath: str) -> None:
         _print_error(f"cannot stat file: {e}")
         sys.exit(1)
 
+    import time as _time
+    _add_start = _time.time()
+
     # Handle empty file - chunker raises ValueError
     try:
         chunk_stream = chunk_file_streaming(str(target))
@@ -197,11 +200,58 @@ def cmd_add(filepath: str) -> None:
     total_uncompressed = 0
     total_compressed = 0
 
+    # Progress bar for large files (rich only, degrades gracefully)
+    use_progress = HAS_RICH and console and file_size > 10 * 1024 * 1024
+    progress = None
+    task_id = None
+    if use_progress:
+        try:
+            from rich.progress import (
+                BarColumn,
+                Progress,
+                SpinnerColumn,
+                TextColumn,
+                TaskProgressColumn,
+                TimeElapsedColumn,
+                TimeRemainingColumn,
+            )
+            progress = Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TaskProgressColumn(),
+                TextColumn("•"),
+                TextColumn("{task.fields[chunk_info]}"),
+                TextColumn("•"),
+                TimeElapsedColumn(),
+                TextColumn("•"),
+                TimeRemainingColumn(),
+                console=console,
+                transient=False,
+            )
+            progress.start()
+            task_id = progress.add_task(
+                f"[cyan]Adding {rel_posix}...", total=file_size, chunk_info="0 chunks"
+            )
+        except Exception:
+            progress = None
+            task_id = None
+
     try:
         for pchunk in processed_iter:
             total_chunks += 1
             total_uncompressed += pchunk.length
             total_compressed += len(pchunk.compressed_data)
+
+            if progress is not None and task_id is not None:
+                try:
+                    progress.update(
+                        task_id,
+                        advance=pchunk.length,
+                        chunk_info=f"{total_chunks} chunks ({new_chunks} new, {reused_chunks} reused)",
+                    )
+                except Exception:
+                    pass
 
             # 5. Deduplicate via LocalStore
             try:
@@ -211,6 +261,11 @@ def cmd_add(filepath: str) -> None:
                     local_store.store_chunk(pchunk.hash, pchunk.compressed_data)
                     new_chunks += 1
             except Exception as e:
+                if progress:
+                    try:
+                        progress.stop()
+                    except Exception:
+                        pass
                 _print_error(f"storage error for chunk {pchunk.hash[:12]}: {e}")
                 sys.exit(1)
 
@@ -222,17 +277,53 @@ def cmd_add(filepath: str) -> None:
                     size_compressed=len(pchunk.compressed_data),
                 )
             except Exception as e:
+                if progress:
+                    try:
+                        progress.stop()
+                    except Exception:
+                        pass
                 _print_error(f"database error recording chunk: {e}")
                 sys.exit(1)
 
+            # Update chunk_info after counts changed
+            if progress is not None and task_id is not None:
+                try:
+                    progress.update(
+                        task_id,
+                        chunk_info=f"{total_chunks} chunks ({new_chunks} new, {reused_chunks} reused)",
+                    )
+                except Exception:
+                    pass
+
     except SystemExit:
+        if progress:
+            try:
+                progress.stop()
+            except Exception:
+                pass
         raise
     except ValueError as e:
+        if progress:
+            try:
+                progress.stop()
+            except Exception:
+                pass
         _print_error(str(e))
         sys.exit(1)
     except Exception as e:
+        if progress:
+            try:
+                progress.stop()
+            except Exception:
+                pass
         _print_error(f"failed to process chunks: {e}")
         sys.exit(1)
+    finally:
+        if progress:
+            try:
+                progress.stop()
+            except Exception:
+                pass
 
     if total_chunks == 0:
         _print_error(f"file is empty or produced no chunks: {filepath}")
@@ -257,11 +348,18 @@ def cmd_add(filepath: str) -> None:
         except Exception:
             pass
 
-    # 8. Success output
+    # 8. Success output with elapsed time
     dedup_pct = (reused_chunks / total_chunks * 100) if total_chunks else 0
+    _elapsed = _time.time() - _add_start
+    # human-readable time: 0.8s, 12.3s, 1m23s
+    if _elapsed < 60:
+        _elapsed_str = f"{_elapsed:.1f}s"
+    else:
+        _m, _s = divmod(int(_elapsed), 60)
+        _elapsed_str = f"{_m}m{_s:02d}s ({_elapsed:.1f}s)"
     _print_success(
         f"Added '{rel_posix}' -> {total_chunks} chunks ({new_chunks} new, {reused_chunks} reused, {dedup_pct:.1f}% dedup) "
-        f"[{total_uncompressed} -> {total_compressed} bytes compressed]"
+        f"[{total_uncompressed} -> {total_compressed} bytes compressed] in {_elapsed_str}"
     )
 
 
@@ -320,7 +418,47 @@ def cmd_commit(message: str) -> None:
         files_in_commit = 0
         total_chunks_in_commit = 0
 
-        for file_rec in tracked_sorted:
+        # Progress for commit re-chunking (rich only, for large repos)
+        total_commit_bytes = 0
+        for fr in tracked_sorted:
+            try:
+                p = repo_root / fr["path"]
+                if p.is_file():
+                    total_commit_bytes += p.stat().st_size
+                else:
+                    alt = pathlib.Path(fr["path"])
+                    if alt.is_file():
+                        total_commit_bytes += alt.stat().st_size
+            except Exception:
+                pass
+
+        use_commit_progress = HAS_RICH and console and total_commit_bytes > 10 * 1024 * 1024
+        commit_progress = None
+        commit_task = None
+        if use_commit_progress:
+            try:
+                from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TaskProgressColumn, TimeElapsedColumn, TimeRemainingColumn
+                commit_progress = Progress(
+                    SpinnerColumn(),
+                    TextColumn("[progress.description]{task.description}"),
+                    BarColumn(),
+                    TaskProgressColumn(),
+                    TextColumn("•"),
+                    TextColumn("{task.fields[info]}"),
+                    TextColumn("•"),
+                    TimeElapsedColumn(),
+                    TextColumn("•"),
+                    TimeRemainingColumn(),
+                    console=console,
+                    transient=False,
+                )
+                commit_progress.start()
+                commit_task = commit_progress.add_task("[cyan]Committing...", total=total_commit_bytes, info=f"0/{len(tracked_sorted)} files")
+            except Exception:
+                commit_progress = None
+
+        processed_bytes = 0
+        for file_idx, file_rec in enumerate(tracked_sorted):
             rel_posix = file_rec["path"]
             # Resolve file on disk: try repo_root / rel_posix, fallback to absolute if outside repo
             disk_path = repo_root / rel_posix
@@ -350,13 +488,35 @@ def cmd_commit(message: str) -> None:
                         }
                     )
                     total_chunks_in_commit += 1
+                    processed_bytes += pchunk.length
+                    if commit_progress is not None and commit_task is not None:
+                        try:
+                            commit_progress.update(commit_task, completed=processed_bytes, info=f"{file_idx+1}/{len(tracked_sorted)} files • {total_chunks_in_commit} chunks")
+                        except Exception:
+                            pass
                 files_in_commit += 1
+                if commit_progress is not None and commit_task is not None:
+                    try:
+                        commit_progress.update(commit_task, info=f"{files_in_commit}/{len(tracked_sorted)} files • {total_chunks_in_commit} chunks")
+                    except Exception:
+                        pass
             except (FileNotFoundError, ValueError) as e:
                 _print_error(f"skipping {rel_posix}: {e}")
                 continue
             except Exception as e:
+                if commit_progress:
+                    try:
+                        commit_progress.stop()
+                    except Exception:
+                        pass
                 _print_error(f"failed to process {rel_posix}: {e}")
                 sys.exit(1)
+
+        if commit_progress:
+            try:
+                commit_progress.stop()
+            except Exception:
+                pass
 
         if not combined_hashes:
             _print_error("no chunks to commit (all tracked files missing or empty)")
@@ -594,6 +754,28 @@ def cmd_checkout(commit_hash: str) -> None:
                 _print_error(f"failed to create directory for {file_path}: {e}")
                 sys.exit(1)
 
+            # Progress for checkout (only for large restores)
+            use_checkout_progress = HAS_RICH and console and len(chunk_refs) > 10
+            co_progress = None
+            co_task = None
+            if use_checkout_progress:
+                try:
+                    from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TaskProgressColumn, TimeElapsedColumn, TimeRemainingColumn
+                    co_progress = Progress(
+                        SpinnerColumn(),
+                        TextColumn("[progress.description]{task.description}"),
+                        BarColumn(),
+                        TaskProgressColumn(),
+                        TimeElapsedColumn(),
+                        TimeRemainingColumn(),
+                        console=console,
+                        transient=True,
+                    )
+                    co_progress.start()
+                    co_task = co_progress.add_task(f"[cyan]Restoring {file_path}...", total=len(chunk_refs))
+                except Exception:
+                    co_progress = None
+
             # Reconstruct via ordered chunks: retrieve + decompress + concatenate
             # Write atomically via tmp + move, verify via chunk_order
             import tempfile
@@ -601,11 +783,16 @@ def cmd_checkout(commit_hash: str) -> None:
             tmp_fd, tmp_name = tempfile.mkstemp(dir=str(out_path.parent), prefix=".checkout_", suffix=".tmp")
             try:
                 with open(tmp_fd, "wb") as out_f:
-                    for ref in chunk_refs:
+                    for idx, ref in enumerate(chunk_refs):
                         ch = ref["chunk_hash"]
                         try:
                             compressed = local_store.retrieve_chunk(ch)
                         except FileNotFoundError:
+                            if co_progress:
+                                try:
+                                    co_progress.stop()
+                                except Exception:
+                                    pass
                             _print_error(f"required chunk {ch[:12]} missing for {file_path} (commit {target_hash[:12]})")
                             try:
                                 out_f.close()
@@ -619,6 +806,11 @@ def cmd_checkout(commit_hash: str) -> None:
                         try:
                             decompressed = decompress(compressed)
                         except Exception as e:
+                            if co_progress:
+                                try:
+                                    co_progress.stop()
+                                except Exception:
+                                    pass
                             _print_error(f"failed to decompress chunk {ch[:12]}: {e}")
                             try:
                                 pathlib.Path(tmp_name).unlink(missing_ok=True)
@@ -629,12 +821,27 @@ def cmd_checkout(commit_hash: str) -> None:
                         # Optional length check vs stored chunk_length
                         expected_len = ref.get("chunk_length")
                         if expected_len and len(decompressed) != expected_len:
+                            if co_progress:
+                                try:
+                                    co_progress.stop()
+                                except Exception:
+                                    pass
                             _print_error(f"chunk length mismatch for {ch[:12]}: expected {expected_len}, got {len(decompressed)}")
                             pathlib.Path(tmp_name).unlink(missing_ok=True)
                             sys.exit(1)
 
                         out_f.write(decompressed)
                         total_bytes += len(decompressed)
+                        if co_progress is not None and co_task is not None:
+                            try:
+                                co_progress.update(co_task, advance=1)
+                            except Exception:
+                                pass
+                if co_progress:
+                    try:
+                        co_progress.stop()
+                    except Exception:
+                        pass
 
                 # Verify reconstructed file hash if possible (optional integrity)
                 # Compare file size vs sum of chunk_lengths
