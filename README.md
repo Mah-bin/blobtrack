@@ -2,7 +2,7 @@
 
 > A `git`-like CLI for **incremental versioning of massive binary files** (videos, AI datasets, 3D models) using **Content-Defined Chunking, SHA-256, Merkle Trees, and Delta Synchronization**.
 
-![Python](https://img.shields.io/badge/python-3.10+-blue) ![Tests](https://img.shields.io/badge/tests-65_passed-brightgreen) ![Status](https://img.shields.io/badge/phase-4_done-green)
+![Python](https://img.shields.io/badge/python-3.10+-blue) ![Tests](https://img.shields.io/badge/tests-99_passed-brightgreen) ![Status](https://img.shields.io/badge/phase-5_done-green)
 
 **Problem:** `git` stores a full 20 GB binary copy on every change → 20 commits = 400 GB wasted.
 **Solution:** `blobtrack` slices files into ~2 MB variable chunks, fingerprints each with SHA-256, and stores **only changed chunks**. A 20 GB edit becomes a ~40 MB delta.
@@ -52,7 +52,8 @@ using CDC                                   (deduplicated)
 *   **Maintainable:** `log` shows history newest first, `gc` deletes only orphans not in `get_active_chunk_hashes()`
 *   **Streaming:** Never loads whole file into RAM (`chunk_file_streaming` + `process_chunks` batch 16, workers 8)
 *   **Atomic:** `LocalStore` writes via `tempfile + fsync + atomic move`, `IndexDB` WAL mode with `IF NOT EXISTS`
-*   **8 CLI commands:** `init, add, commit, log, checkout, gc, push, pull` (6 implemented, 2 stubbed)
+*   **Remote sync:** `push` transfers only missing chunks + commits, `pull` fetches delta, zero-transfer on re-sync
+*   **8 CLI commands:** `init, add, commit, log, checkout, gc, push, pull` (all 8 fully implemented)
 
 ## 3. Installation
 
@@ -117,6 +118,18 @@ blobtrack checkout ca6543a654c6
 
 blobtrack gc
 # Garbage collection: no orphan chunks found - all 0 orphans, 0 bytes freed
+
+# Push to a remote location
+blobtrack push D:\backup\demo_remote
+# Push complete: Commits synced 2, Chunks transferred 3, Skipped 0
+
+# Pull into a different repo
+cd C:\other\clone
+blobtrack init
+blobtrack pull D:\backup\demo_remote
+# Pull complete: Commits synced 2, Chunks transferred 3
+blobtrack checkout ca6543a654c6
+# Checked out ca6543a654c6 - restored 1 file(s), exact SHA-256 match
 ```
 
 ## 5. Usage
@@ -133,6 +146,8 @@ blobtrack gc
 | `blobtrack log` | Show commit history newest first | `blobtrack log` | ✅ Phase 4 |
 | `blobtrack checkout <hash>` | Reconstruct files from commit (exact SHA-256 verified) | `blobtrack checkout ca6543a6` | ✅ Phase 4 |
 | `blobtrack gc` | Delete orphan chunks not in any commit | `blobtrack gc` | ✅ Phase 4 |
+| `blobtrack push <remote>` | Push delta chunks + commits to remote | `blobtrack push D:\backup` | ✅ Phase 5 |
+| `blobtrack pull <remote>` | Pull delta chunks + commits from remote | `blobtrack pull D:\backup` | ✅ Phase 5 |
 
 **`blobtrack init`:** Creates `.blobtrack/objects/`, `.blobtrack/commits/`, `.blobtrack/index.db` (WAL SQLite, `0o700`). Idempotent — second run: `Error: repository already initialized` (no delete).
 
@@ -176,18 +191,27 @@ blobtrack commit -m "v2"      # same content -> same root 01a19c parent v1, delt
 # 10 MB 2-chunk file, patch 1KB at 2MB, add + commit -> 1 new 1 reused 50% delta +1 -1
 blobtrack checkout v1         # restores exact original SHA-256
 blobtrack gc                  # deletes only deadbeef orphan, preserves active
+
+# Remote sync (Phase 5)
+blobtrack push D:\backup\remote  # transfers only new chunks, auto-inits remote
+blobtrack push D:\backup\remote  # second push: "Everything up-to-date" (zero-transfer)
+# Clone: init → pull → checkout → exact SHA-256 match
 ```
 
-### 5.2 Planned Commands (Stubbed)
+**`blobtrack push <remote>`:**
+*   Validates local repo, resolves remote path (relative or absolute), auto-creates remote `.blobtrack/` via `init_remote()`
+*   Delegates to `RemoteSync.push(remote, local_store, local_db)` — delta detection via `has_chunk()`, transfers only missing chunks
+*   Syncs commits oldest-to-newest, skips already-synced commits
+*   Reports: `Commits synced N, Chunks transferred M, Skipped K, Bytes, Throughput`
+*   Zero-transfer on repeat: `"Everything up-to-date"`
 
-Registered in `argparse` but currently return `Error: ... not available yet` (`exit 1`):
+**`blobtrack pull <remote>`:**
+*   Validates local repo + remote `.blobtrack/objects/` exists, else controlled error with hint
+*   Delegates to `RemoteSync.pull(remote, local_store, local_db)` — fetches only missing chunks
+*   Does NOT modify working tree — user must `checkout` after pull
+*   Reports same stats table + hint: `"Use 'blobtrack checkout <hash>' to restore a version"`
 
-| Command | Increment | Status |
-|---|---|---|
-| `blobtrack push <remote>` | Inc.5 remote sync (Member 4+3) | ⏳ stub |
-| `blobtrack pull <remote>` | Inc.5 | ⏳ stub |
-
-> `push`/`pull` default to `origin` if no remote given (`nargs="?" default="origin"`).
+> `push`/`pull` default to `"origin"` if no remote given. "origin" is a literal path, not a stored alias.
 
 ## 6. Project Architecture
 
@@ -201,7 +225,7 @@ Registered in `argparse` but currently return `Error: ... not available yet` (`e
                     └──────┬───────┘
                            |
                     ┌──────────────┐
-                    │cli/commands.py│  cmd_init() ✅ + cmd_add() ✅ + cmd_commit() ✅ + cmd_log() ✅ + cmd_checkout() ✅ + cmd_gc() ✅ + 2 stubs
+                    │cli/commands.py│  cmd_init() ✅ + cmd_add() ✅ + cmd_commit() ✅ + cmd_log() ✅ + cmd_checkout() ✅ + cmd_gc() ✅ + cmd_push() ✅ + cmd_pull() ✅
                     └──────┬───────┘
                            |
               ┌────────────┴─────────────┐
@@ -247,6 +271,7 @@ blobtrack/
 │   ├── test_chunker.py
 │   ├── test_hasher.py
 │   ├── test_cli.py          # Member 1 - CLI + add/commit/log/checkout/gc integration tests
+│   ├── test_remote_cli.py   # Member 1 - Phase 5 push/pull + round-trip + dedup tests (26 tests)
 │   ├── test_index_db.py     # Member 4
 │   ├── test_local_store.py
 │   └── test_remote_sync.py
@@ -262,7 +287,7 @@ blobtrack/
 
 ## 8. Development Status
 
-Incremental, each phase produces a working demo. Current branch: `cli/P4` at Phase 4, `main` at `60f6daf` until PR merged.
+Incremental, each phase produces a working demo. Current branch: `cli/P5` at Phase 5, `main` at `60f6daf` until PR merged.
 
 | Phase | What | Who Leads | Deliverable | Status |
 |---|---|---|---|---|
@@ -270,18 +295,18 @@ Incremental, each phase produces a working demo. Current branch: `cli/P4` at Pha
 | **2** | CDC chunking + compression + local storage | Member 2+4 | `blobtrack add` slices & stores deduplicated | **DONE** `cli/P2` |
 | **3** | Merkle Tree + delta diffing + `commit` | Member 3+1 | `blobtrack commit` builds tree, detects changes, persists snapshot | **DONE** `cli/P3` |
 | **4** | History + `checkout` + `gc` | Member 1+4 | `log`/`checkout`/`gc` work - exact reconstruction, orphan GC | **DONE** `cli/P4` |
-| 5 | Remote `push`/`pull` delta sync | Member 4+3 | only new chunks transferred | ⏳ Next |
+| **5** | Remote `push`/`pull` delta sync | Member 1+4 | delta push/pull, dedup, round-trip, 99 tests | **DONE** `cli/P5` |
 
 ## 9. Testing
 
 ```bash
-# All tests (65: 11 chunker + 29 cli (init/add/commit/log/checkout/gc) + 13 hasher/index_db/local_store/remote)
+# All tests (99: 11 chunker + 30 cli + 26 remote_cli + 13 hasher + 6 index_db + 5 local_store + 2 remote_sync + 6 misc)
 py -m pytest tests/ -v
 
 # Compile check
 py -m compileall blobtrack
 
-# Manual Phase 1-4 acceptance (isolated C:\tmp)
+# Manual Phase 1-5 acceptance (isolated C:\tmp)
 mkdir C:\tmp\verify; cd C:\tmp\verify
 blobtrack init
 blobtrack add test.bin        # 240KB -> 1 chunks (1 new)
@@ -292,12 +317,17 @@ blobtrack commit -m "v2"      # second same file same root parent v1
 blobtrack log                 # 2 commits newest first
 blobtrack checkout <v1>       # restores exact original SHA-256
 blobtrack gc                  # no orphans or deletes deadbeef orphan
-# 10MB 2 chunks -> 1 new 1 reused 50% after 1KB patch
+blobtrack push D:\backup\repo  # transfers chunks + commits to remote
+# In a new clone:
+blobtrack init
+blobtrack pull D:\backup\repo  # fetches chunks + commits from remote
+blobtrack checkout <v1>        # restores exact bytes, SHA-256 verified
 
 # Specific suites
-py -m pytest tests/test_hasher.py tests/test_chunker.py -v  # Member 2
+py -m pytest tests/test_hasher.py tests/test_chunker.py -v     # Member 2
 py -m pytest tests/test_index_db.py tests/test_local_store.py -v  # Member 4
-py -m pytest tests/test_cli.py -k "log or checkout or gc" -v  # Member 1 Phase 4
+py -m pytest tests/test_cli.py -k "log or checkout or gc" -v   # Member 1 Phase 4
+py -m pytest tests/test_remote_cli.py -v                        # Member 1 Phase 5
 ```
 
 ## 10. Tech Stack
@@ -319,7 +349,7 @@ py -m pytest tests/test_cli.py -k "log or checkout or gc" -v  # Member 1 Phase 4
 *   `docs/cli_documentation.txt` — `main.py`/`commands.py` `cmd_add` 8-step + `cmd_commit` 9-contract + `cmd_log/checkout/gc` Phase 4 flow
 *   `docs/core_engine_documentation.txt` — CDC, hashing, Merkle, differ
 *   `docs/storage_documentation.md` — `IndexDB`/`LocalStore` APIs
-*   `docs/integration_contract.md` — Member 2/3 confirmed, Member 4 validated, 9 Phase 3 contracts + Phase 4 log/checkout/gc contracts
+*   `docs/integration_contract.md` — Member 2/3 confirmed, Member 4 validated, 14 contracts (Phase 3 + Phase 5 push/pull)
 
 ## 12. Team Roles
 

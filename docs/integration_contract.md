@@ -135,9 +135,38 @@ CLI will stay `main.py` unchanged; only `commands.py:cmd_add()` implementation w
 
 ---
 
+## Phase 5 — Remote Sync: Push/Pull CLI Integration — COMPLETE
+
+Source: `blobtrack/cli/commands.py:cmd_push()`, `cmd_pull()` — Phase 5, branch `cli/P5`.
+
+**Contract 10 — Push delegation:** `cmd_push(remote)` delegates entirely to `RemoteSync.push(remote_path, local_store, local_db)`. The CLI does NOT compute deltas; `RemoteSync` handles delta detection internally via `has_chunk()`. Returns stats dict `{transferred_chunks, transferred_bytes, skipped_chunks, commits_synced}`.
+
+**Contract 11 — Pull delegation:** `cmd_pull(remote)` delegates to `RemoteSync.pull(remote_path, local_store, local_db)`. The CLI validates the remote exists before calling. Pull does NOT modify the working tree — user must explicitly `checkout` after pull.
+
+**Contract 12 — Remote path semantics:** No persistent alias system. "origin" is treated as a literal filesystem path. Relative paths resolved against cwd. `RemoteSync._resolve_remote_paths` handles both `repo/` and `repo/.blobtrack/` paths.
+
+**Contract 13 — Remote initialization:** `RemoteSync.push()` calls `init_remote()` internally on first push. The CLI does NOT need to pre-create remote structure. `cmd_pull()` validates remote `.blobtrack/objects/` exists before calling.
+
+**Contract 14 — Delta ownership:** Delta calculation for push/pull lives entirely in `RemoteSync` (Member 4). CLI's job is validate → delegate → display. No `compute_delta_by_set()` calls from CLI.
+
+**Test coverage:** 26 new tests in `test_remote_cli.py`:
+- Push: first, repeat, incremental, multi-file, parent chain, no commits, no repo, invalid path
+- Pull: existing repo, fresh clone, repeat, no repo, missing remote, invalid structure
+- Round-trip: A→push→remote→pull→B→checkout (SHA-256 exact match)
+- Bidirectional: A→push→B→modify→push→A→pull→checkout (both versions)
+- Dedup: first=all new, incremental=skips, zero-transfer, pull zero
+- GC interaction: GC → push → pull → checkout
+- Subprocess: push/pull via `blobtrack` CLI invocation
+
+---
+
 ## Status
 
 - [x] Phase 0 — Member 2 interfaces inspected, 20 tests pass
 - [x] Phase 1 — CLI foundation + init complete (main.py + commands.py + empty index.db)
-- [x] Integration contract documented
-- [ ] Awaiting Member 4 confirmation of storage APIs before Phase 2 `add` integration
+- [x] Phase 2 — `blobtrack add` integration complete (Member 2 + Member 4)
+- [x] Phase 3 — `blobtrack commit` integration complete (Member 3 + Member 4, Merkle tree + delta)
+- [x] Phase 4 — `blobtrack log`, `checkout`, `gc` complete (Member 4 IndexDB + LocalStore)
+- [x] Phase 5 — `blobtrack push`, `pull` complete (Member 4 RemoteSync, 99 tests passing)
+- [x] Integration contract documented (14 contracts)
+

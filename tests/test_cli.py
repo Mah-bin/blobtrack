@@ -488,14 +488,24 @@ class TestGCIntegration:
 
 
 # ---------------------------------------------------------------------------
-# Stub tests - future commands must exit 1 with controlled message
+# Phase 5 - push/pull are now implemented (no longer stubs)
+# Comprehensive tests in test_remote_cli.py
 # ---------------------------------------------------------------------------
 
-class TestStubs:
-    def test_push_pull_stubs(self):
-        from blobtrack.cli.commands import cmd_push, cmd_pull
+class TestPushPullImplemented:
+    def test_push_requires_repo(self, tmp_path, monkeypatch):
+        """Push outside a repo exits 1 with controlled error."""
+        monkeypatch.chdir(tmp_path)
+        from blobtrack.cli.commands import cmd_push
+        with pytest.raises(SystemExit) as exc:
+            cmd_push(str(tmp_path / "some_remote"))
+        assert exc.value.code == 1
 
-        for fn, arg in [(cmd_push, "origin"), (cmd_pull, "origin")]:
-            with pytest.raises(SystemExit) as exc:
-                fn(arg)
-            assert exc.value.code == 1
+    def test_pull_requires_repo(self, tmp_path, monkeypatch):
+        """Pull outside a repo exits 1 with controlled error."""
+        monkeypatch.chdir(tmp_path)
+        from blobtrack.cli.commands import cmd_pull
+        with pytest.raises(SystemExit) as exc:
+            cmd_pull(str(tmp_path / "some_remote"))
+        assert exc.value.code == 1
+

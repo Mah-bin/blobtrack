@@ -318,14 +318,89 @@ FUNCTION: cmd_checkout(commit_hash: str) -> None
     Returns: exit 0 on success, 1 on invalid/not found/missing chunk.
 
 FUNCTION: cmd_push(remote: str) -> None
-    STUB — Increment 5.
-    Will be implemented when remote sync (Member 4) is available.
-    Currently prints: "push functionality is not available yet"
+    Increment 5 — Fully implemented. Pushes delta chunks and commit history
+    to a remote repository via Member 4 RemoteSync.push().
+
+    What it does:
+        1. Verify local repo exists via _find_repo_root() else "not a repo"
+        2. Resolve remote path: relative paths resolved against cwd, absolute
+           used directly. If neither remote nor parent directory exist ->
+           "remote path not accessible" with hint (exit 1)
+        3. Open local IndexDB + LocalStore from .blobtrack
+        4. Check if any commits exist; if none -> "Nothing to push" (exit 0)
+        5. Delegate entirely to RemoteSync.push(remote_path, local_store,
+           local_db) which handles:
+           - Remote initialization via init_remote() if target is empty
+           - Delta chunk detection via has_chunk() on remote store
+           - Chunk transfer (only missing chunks transferred)
+           - Commit history sync (oldest-to-newest, skips already-synced)
+           - Chunk metadata sync (record_chunk on remote DB)
+        6. Display Rich table (or plain text) with transfer summary:
+           - Commits synced, Chunks transferred, Chunks skipped (dedup)
+           - Bytes transferred (human-readable KB/MB)
+           - Throughput (MB/s), Elapsed time
+        7. If zero transfer + zero commits -> "Everything up-to-date"
+
+    Remote Path Semantics:
+        - Accepts any filesystem path: D:\backup\repo, .\relative\path
+        - No persistent remote aliases (no "origin" config stored)
+        - "origin" (argparse default) is treated as a literal path
+        - RemoteSync._resolve_remote_paths handles both repo/ and
+          repo/.blobtrack/ paths transparently
+        - Auto-creates remote .blobtrack structure if target is empty
+
+    Delta Ownership:
+        Delta calculation is handled entirely inside RemoteSync.push().
+        The CLI does NOT compute deltas or call compute_delta_by_set().
+        This preserves single-authority delta logic in Member 4's code.
+
+    Safety: no traceback for normal errors, exit 1 on failure,
+    handles FileNotFoundError for inaccessible remotes, always closes
+    IndexDB in finally block.
+
+    Args:
+        remote: Filesystem path string (from argparse, default "origin")
+    Returns:
+        Exits 0 on success, 1 on validation/remote/storage error.
 
 FUNCTION: cmd_pull(remote: str) -> None
-    STUB — Increment 5.
-    Will be implemented when remote sync (Member 4) is available.
-    Currently prints: "pull functionality is not available yet"
+    Increment 5 — Fully implemented. Pulls delta chunks and commit history
+    from a remote repository via Member 4 RemoteSync.pull().
+
+    What it does:
+        1. Verify local repo exists via _find_repo_root() else "not a repo"
+        2. Resolve remote path (same as push)
+        3. Verify remote is a valid blobtrack repo by checking
+           remote/.blobtrack/objects/ exists. If not -> "remote repository
+           not found" with hint showing expected path (exit 1)
+        4. Open local IndexDB + LocalStore from .blobtrack
+        5. Delegate to RemoteSync.pull(remote_path, local_store, local_db)
+           which handles:
+           - Opening remote store and DB
+           - Chunk transfer (only missing chunks transferred)
+           - Commit sync (oldest-to-newest, skips already-synced)
+           - Chunk metadata sync (record_chunk on local DB)
+        6. Display Rich table (or plain text) with transfer summary
+        7. If zero transfer + zero commits -> "Already up-to-date"
+        8. If commits synced > 0, print hint:
+           "Use 'blobtrack log' to view history, 'blobtrack checkout
+           <hash>' to restore a version."
+
+    Pull Does NOT Auto-Checkout:
+        Pull only synchronizes repository data and history. It does NOT
+        modify the working tree. The user must explicitly run
+        'blobtrack checkout <hash>' to restore files. This preserves the
+        separation between data sync and working tree modification
+        established in Phase 4.
+
+    Safety: validates remote structure before calling RemoteSync,
+    no traceback for normal errors, exit 1 on failure, always closes
+    IndexDB in finally block.
+
+    Args:
+        remote: Filesystem path string (from argparse, default "origin")
+    Returns:
+        Exits 0 on success, 1 on validation/remote/storage error.
 
 FUNCTION: cmd_gc() -> None
     Increment 4 — Fully implemented. Garbage collects orphan chunks via

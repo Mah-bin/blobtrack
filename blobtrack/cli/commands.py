@@ -878,13 +878,285 @@ def cmd_checkout(commit_hash: str) -> None:
 
 
 def cmd_push(remote: str) -> None:
-    _print_error("push functionality is not available yet (Increment 5 - requires remote sync)")
-    sys.exit(1)
+    """
+    Phase 5: Push delta chunks and commit history to a remote repository.
+    Uses Member 4 RemoteSync.push() — delta calculation, chunk deduplication,
+    and commit synchronization are all handled inside RemoteSync.
+    The CLI's job is: validate → delegate → display.
+    """
+    import time as _time
+
+    # 1. Validate local repository
+    repo_root = _find_repo_root()
+    if repo_root is None:
+        _print_error("not a blobtrack repository. Run 'blobtrack init' first.")
+        sys.exit(1)
+
+    # 2. Validate remote path
+    remote_path = pathlib.Path(remote)
+    if not remote_path.is_absolute():
+        # Resolve relative to cwd
+        remote_path = (pathlib.Path.cwd() / remote_path).resolve()
+    else:
+        remote_path = remote_path.resolve()
+
+    # Check if "origin" or similar name was passed without being a real path
+    # If it doesn't exist and isn't an absolute-looking path, it's likely
+    # a named alias which we don't support
+    if not remote_path.exists() and not remote_path.parent.exists():
+        _print_error(
+            f"remote path not accessible: {remote}\n"
+            "  Hint: provide a filesystem path, e.g. 'blobtrack push D:\\backup\\repo'"
+        )
+        sys.exit(1)
+
+    # 3. Open local storage handles
+    db_path = repo_root / ".blobtrack" / "index.db"
+    objects_dir = repo_root / ".blobtrack" / "objects"
+
+    try:
+        from blobtrack.storage.index_db import IndexDB
+        from blobtrack.storage.local_store import LocalStore
+        from blobtrack.storage.remote_sync import RemoteSync
+    except ImportError as e:
+        _print_error(f"missing dependency for push: {e}")
+        sys.exit(1)
+
+    try:
+        index_db = IndexDB(db_path)
+        local_store = LocalStore(objects_dir)
+    except Exception as e:
+        _print_error(f"failed to open repository storage: {e}")
+        sys.exit(1)
+
+    try:
+        # 4. Check if there is anything to push
+        commits = index_db.list_commits()
+        if not commits:
+            _print_success("Nothing to push — no commits in this repository.")
+            return
+
+        # 5. Delegate to RemoteSync.push()
+        # RemoteSync handles: init_remote, delta detection, chunk transfer,
+        # commit sync (oldest-to-newest), deduplication via has_chunk.
+        start_time = _time.time()
+
+        stats = RemoteSync.push(
+            remote_path=remote_path,
+            local_store=local_store,
+            local_db=index_db,
+        )
+
+        elapsed = _time.time() - start_time
+
+        # 6. Display results
+        transferred = stats.get("transferred_chunks", 0)
+        skipped = stats.get("skipped_chunks", 0)
+        transferred_bytes = stats.get("transferred_bytes", 0)
+        commits_synced = stats.get("commits_synced", 0)
+
+        if transferred == 0 and commits_synced == 0:
+            _print_success("Everything up-to-date.")
+        else:
+            # Format bytes nicely
+            if transferred_bytes >= 1024 * 1024:
+                bytes_str = f"{transferred_bytes / (1024 * 1024):.1f} MB"
+            elif transferred_bytes >= 1024:
+                bytes_str = f"{transferred_bytes / 1024:.1f} KB"
+            else:
+                bytes_str = f"{transferred_bytes} bytes"
+
+            # Throughput
+            if elapsed > 0 and transferred_bytes > 0:
+                throughput = transferred_bytes / elapsed
+                if throughput >= 1024 * 1024:
+                    tp_str = f"{throughput / (1024 * 1024):.1f} MB/s"
+                elif throughput >= 1024:
+                    tp_str = f"{throughput / 1024:.1f} KB/s"
+                else:
+                    tp_str = f"{throughput:.0f} B/s"
+            else:
+                tp_str = "-"
+
+            if HAS_RICH and console:
+                from rich.table import Table
+
+                table = Table(title="Push complete", show_lines=False)
+                table.add_column("Metric", style="cyan", no_wrap=True)
+                table.add_column("Value", style="white")
+                table.add_row("Commits synced", str(commits_synced))
+                table.add_row("Chunks transferred", str(transferred))
+                table.add_row("Chunks skipped (dedup)", str(skipped))
+                table.add_row("Bytes transferred", bytes_str)
+                table.add_row("Throughput", tp_str)
+                table.add_row("Elapsed", f"{elapsed:.2f}s")
+                console.print(table)
+            else:
+                print(f"Push complete")
+                print(f"  Commits synced:        {commits_synced}")
+                print(f"  Chunks transferred:    {transferred}")
+                print(f"  Chunks skipped (dedup):{skipped}")
+                print(f"  Bytes transferred:     {bytes_str}")
+                print(f"  Throughput:            {tp_str}")
+                print(f"  Elapsed:               {elapsed:.2f}s")
+
+        _print_success(f"Pushed to {remote_path}")
+
+    except FileNotFoundError as e:
+        _print_error(f"remote path error: {e}")
+        sys.exit(1)
+    except Exception as e:
+        _print_error(f"push failed: {e}")
+        sys.exit(1)
+    finally:
+        try:
+            index_db.close()
+        except Exception:
+            pass
 
 
 def cmd_pull(remote: str) -> None:
-    _print_error("pull functionality is not available yet (Increment 5 - requires remote sync)")
-    sys.exit(1)
+    """
+    Phase 5: Pull delta chunks and commit history from a remote repository.
+    Uses Member 4 RemoteSync.pull() — chunk deduplication and commit
+    synchronization are handled inside RemoteSync.
+    Pull does NOT modify the working tree. Use 'blobtrack checkout <hash>'
+    after pulling to restore a specific version.
+    """
+    import time as _time
+
+    # 1. Validate local repository
+    repo_root = _find_repo_root()
+    if repo_root is None:
+        _print_error("not a blobtrack repository. Run 'blobtrack init' first.")
+        sys.exit(1)
+
+    # 2. Validate remote path
+    remote_path = pathlib.Path(remote)
+    if not remote_path.is_absolute():
+        remote_path = (pathlib.Path.cwd() / remote_path).resolve()
+    else:
+        remote_path = remote_path.resolve()
+
+    # Verify remote exists and looks like a blobtrack repo
+    # RemoteSync._resolve_remote_paths handles both dir and .blobtrack paths
+    remote_bt = remote_path / ".blobtrack" if remote_path.name != ".blobtrack" else remote_path
+    remote_objects = remote_bt / "objects"
+    if not remote_objects.is_dir():
+        _print_error(
+            f"remote repository not found at: {remote}\n"
+            f"  Expected .blobtrack/objects at {remote_objects}\n"
+            "  Hint: provide the path to a blobtrack repository"
+        )
+        sys.exit(1)
+
+    # 3. Open local storage handles
+    db_path = repo_root / ".blobtrack" / "index.db"
+    objects_dir = repo_root / ".blobtrack" / "objects"
+
+    try:
+        from blobtrack.storage.index_db import IndexDB
+        from blobtrack.storage.local_store import LocalStore
+        from blobtrack.storage.remote_sync import RemoteSync
+    except ImportError as e:
+        _print_error(f"missing dependency for pull: {e}")
+        sys.exit(1)
+
+    try:
+        index_db = IndexDB(db_path)
+        local_store = LocalStore(objects_dir)
+    except Exception as e:
+        _print_error(f"failed to open repository storage: {e}")
+        sys.exit(1)
+
+    try:
+        # 4. Delegate to RemoteSync.pull()
+        # RemoteSync handles: chunk transfer, deduplication,
+        # commit sync (oldest-to-newest).
+        start_time = _time.time()
+
+        stats = RemoteSync.pull(
+            remote_path=remote_path,
+            local_store=local_store,
+            local_db=index_db,
+        )
+
+        elapsed = _time.time() - start_time
+
+        # 5. Display results
+        transferred = stats.get("transferred_chunks", 0)
+        skipped = stats.get("skipped_chunks", 0)
+        transferred_bytes = stats.get("transferred_bytes", 0)
+        commits_synced = stats.get("commits_synced", 0)
+
+        if transferred == 0 and commits_synced == 0:
+            _print_success("Already up-to-date.")
+        else:
+            # Format bytes nicely
+            if transferred_bytes >= 1024 * 1024:
+                bytes_str = f"{transferred_bytes / (1024 * 1024):.1f} MB"
+            elif transferred_bytes >= 1024:
+                bytes_str = f"{transferred_bytes / 1024:.1f} KB"
+            else:
+                bytes_str = f"{transferred_bytes} bytes"
+
+            # Throughput
+            if elapsed > 0 and transferred_bytes > 0:
+                throughput = transferred_bytes / elapsed
+                if throughput >= 1024 * 1024:
+                    tp_str = f"{throughput / (1024 * 1024):.1f} MB/s"
+                elif throughput >= 1024:
+                    tp_str = f"{throughput / 1024:.1f} KB/s"
+                else:
+                    tp_str = f"{throughput:.0f} B/s"
+            else:
+                tp_str = "-"
+
+            if HAS_RICH and console:
+                from rich.table import Table
+
+                table = Table(title="Pull complete", show_lines=False)
+                table.add_column("Metric", style="cyan", no_wrap=True)
+                table.add_column("Value", style="white")
+                table.add_row("Commits synced", str(commits_synced))
+                table.add_row("Chunks transferred", str(transferred))
+                table.add_row("Chunks skipped (dedup)", str(skipped))
+                table.add_row("Bytes transferred", bytes_str)
+                table.add_row("Throughput", tp_str)
+                table.add_row("Elapsed", f"{elapsed:.2f}s")
+                console.print(table)
+            else:
+                print(f"Pull complete")
+                print(f"  Commits synced:        {commits_synced}")
+                print(f"  Chunks transferred:    {transferred}")
+                print(f"  Chunks skipped (dedup):{skipped}")
+                print(f"  Bytes transferred:     {bytes_str}")
+                print(f"  Throughput:            {tp_str}")
+                print(f"  Elapsed:               {elapsed:.2f}s")
+
+        _print_success(f"Pulled from {remote_path}")
+
+        # Helpful hint for user
+        if commits_synced > 0:
+            if HAS_RICH and console:
+                console.print(
+                    f"[dim]Use 'blobtrack log' to view history, "
+                    f"'blobtrack checkout <hash>' to restore a version.[/dim]"
+                )
+            else:
+                print("Use 'blobtrack log' to view history, 'blobtrack checkout <hash>' to restore a version.")
+
+    except FileNotFoundError as e:
+        _print_error(f"remote repository error: {e}")
+        sys.exit(1)
+    except Exception as e:
+        _print_error(f"pull failed: {e}")
+        sys.exit(1)
+    finally:
+        try:
+            index_db.close()
+        except Exception:
+            pass
 
 
 def cmd_gc() -> None:
