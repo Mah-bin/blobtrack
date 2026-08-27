@@ -89,9 +89,10 @@ MODULE OVERVIEW:
     parses the user's input and calls the appropriate function here.
 
     Member 1 - CLI & Integration Lead
-    Phase 1: cmd_init() fully implemented. All other commands are
-    controlled placeholders that print "not available yet" messages
-    until Members 2/3/4 deliver their modules in later increments.
+    Phase 1+2: cmd_init() and cmd_add() fully implemented. Remaining
+    commands (commit/log/checkout/push/pull/gc) are controlled
+    placeholders that print "not available yet" messages until Members
+    3/4 deliver their modules in later increments.
 
 HELPER: _print_success(msg: str) -> None
     Prints a green success message using the Rich library.
@@ -144,9 +145,51 @@ FUNCTION: cmd_init(cwd: pathlib.Path | None = None) -> None
              This parameter exists primarily for testing purposes.
 
 FUNCTION: cmd_add(filepath: str) -> None
-    STUB — Increment 2.
-    Will be implemented when the storage layer (Member 4) is available.
-    Currently prints: "add functionality is not available yet"
+    Increment 2 — Fully implemented. Chunks, compresses, deduplicates and
+    stores a file via Member 2 + Member 4 integration.
+
+    What it does (8 steps):
+        1. Verify repository exists by walking up parents hunting .blobtrack/
+           else "not a blobtrack repository. Run 'blobtrack init' first." (exit 1)
+        2. Resolve filepath via pathlib.Path.resolve() (handles relative/absolute,
+           spaces) and verify exists + is_file else "file not found"/"not a file"
+        3. Open storage handles: LocalStore(repo/.blobtrack/objects) and
+           IndexDB(repo/.blobtrack/index.db) (Member 4)
+        4. Stream chunks via Member 2: chunk_file_streaming(filepath) ->
+           ChunkData(index,offset,length,data) then
+           process_chunks(stream,batch 16,workers 8) ->
+           ProcessedChunk(index,offset,length,hash,compressed_data) which
+           already does hash_bytes(SHA-256) + compress(Zstandard). Never
+           loads whole file into RAM, never re-hashes in CLI.
+        5. For each ProcessedChunk: has_chunk(hash)? reused++ : store_chunk(
+           hash,compressed) -> new++ ; uses atomic tempfile+fsync+move inside
+           LocalStore, never writes .blobtrack/objects directly.
+        6. Record chunk metadata idempotently: IndexDB.record_chunk(
+           hash,uncompressed=len,compressed=len(compressed))
+        7. After loop, register file: hash_file_streaming(filepath) for file
+           hash + stat size/mtime -> IndexDB.register_file(posix_rel_path,
+           file_hash,size,last_modified,status="tracked")
+        8. Output via Rich: "Added 'rel' -> N chunks (new, reused, dedup%) [uncompressed -> compressed bytes]"
+
+    Safety Features:
+        - Repo/file validation before any I/O, no traceback for normal user errors
+        - Path resolved and stored as repo-relative posix (or absolute if outside repo)
+        - Empty file raises ValueError -> controlled error
+        - Deduplication via has_chunk before store_chunk ensures identical chunks
+          produce identical hash and are stored once (tested 10MB 2 chunks ->
+          1KB patch -> 1 new 1 reused 50% dedup)
+        - Atomic storage via Member 4 LocalStore, DB via IndexDB WAL
+        - On storage/DB exception, exits 1 with Error: prefix, does not
+          leave half-registered metadata (record_chunk is idempotent)
+
+    Does NOT call MerkleTree/build_tree or save_commit — those belong to
+    Increment 3 commit. Does NOT modify core/* or storage/* implementations.
+
+    Args:
+        filepath: Path string as typed by user (relative or absolute)
+    Returns:
+        Exits 0 on success, 1 on user/storage error. Prints success via
+        _print_success or error via _print_error.
 
 FUNCTION: cmd_commit(message: str) -> None
     STUB — Increment 3.
