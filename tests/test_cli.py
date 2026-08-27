@@ -331,31 +331,171 @@ class TestCommitIntegration:
 
 
 # ---------------------------------------------------------------------------
-# Stub tests - future commands must exit 1 with controlled message
+# Phase 4 - log / checkout / gc integration
 # ---------------------------------------------------------------------------
 
-class TestStubs:
-    def test_log_stub_exits_1(self):
+class TestLogIntegration:
+    def test_log_without_repo(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
         from blobtrack.cli.commands import cmd_log
-
         with pytest.raises(SystemExit) as exc:
             cmd_log()
         assert exc.value.code == 1
 
-    def test_checkout_stub_exits_1(self):
-        from blobtrack.cli.commands import cmd_checkout
+    def test_log_empty(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.chdir(tmp_path)
+        cmd_init(cwd=tmp_path)
+        from blobtrack.cli.commands import cmd_log
+        # Should not exit, just print No commits
+        cmd_log()
+        captured = capsys.readouterr()
+        assert "No commits" in captured.out or "No commits" in captured.err or "0" in captured.out
 
+    def test_log_one_and_multiple(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        cmd_init(cwd=tmp_path)
+        f = tmp_path / "f.bin"
+        f.write_bytes(b"log test " * 2000)
+        from blobtrack.cli.commands import cmd_add, cmd_commit, cmd_log
+        cmd_add(str(f))
+        cmd_commit("first log")
+        from blobtrack.storage.index_db import IndexDB
+        db = IndexDB(tmp_path / ".blobtrack" / "index.db")
+        assert len(db.list_commits()) == 1
+        db.close()
+        # Add second commit
+        f.write_bytes(b"log test v2 " * 2000)
+        cmd_add(str(f))
+        cmd_commit("second log")
+        db = IndexDB(tmp_path / ".blobtrack" / "index.db")
+        commits = db.list_commits()
+        assert len(commits) == 2
+        assert commits[0]["message"] == "second log"  # newest first
+        db.close()
+        # Should not raise
+        cmd_log()
+
+
+class TestCheckoutIntegration:
+    def test_checkout_requires_repo(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        from blobtrack.cli.commands import cmd_checkout
         with pytest.raises(SystemExit) as exc:
             cmd_checkout("abc123")
         assert exc.value.code == 1
 
-    def test_push_pull_gc_stubs(self):
-        from blobtrack.cli.commands import cmd_push, cmd_pull, cmd_gc
+    def test_checkout_invalid_hash(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        cmd_init(cwd=tmp_path)
+        from blobtrack.cli.commands import cmd_checkout
+        with pytest.raises(SystemExit) as exc:
+            cmd_checkout("zzzzzz")  # not hex
+        assert exc.value.code == 1
+        with pytest.raises(SystemExit) as exc:
+            cmd_checkout("deadbeef")  # not found
+        assert exc.value.code == 1
 
-        for fn, arg in [(cmd_push, "origin"), (cmd_pull, "origin"), (cmd_gc, None)]:
+    def test_checkout_restores_exact(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        cmd_init(cwd=tmp_path)
+        f = tmp_path / "orig.bin"
+        orig = b"checkout exact bytes " * 3000
+        f.write_bytes(orig)
+        import hashlib
+        orig_hash = hashlib.sha256(orig).hexdigest()
+        from blobtrack.cli.commands import cmd_add, cmd_commit, cmd_checkout
+        cmd_add(str(f))
+        cmd_commit("v1")
+        from blobtrack.storage.index_db import IndexDB
+        db = IndexDB(tmp_path / ".blobtrack" / "index.db")
+        c1 = db.list_commits()[0]["commit_hash"]
+        db.close()
+        # Modify
+        f.write_bytes(b"modified " * 4000)
+        cmd_add(str(f))
+        cmd_commit("v2")
+        # Checkout v1 -> must restore orig
+        cmd_checkout(c1)
+        restored = f.read_bytes()
+        assert hashlib.sha256(restored).hexdigest() == orig_hash
+        assert restored == orig
+
+    def test_checkout_multi_file(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        cmd_init(cwd=tmp_path)
+        a = tmp_path / "a.txt"
+        b = tmp_path / "b.txt"
+        a.write_bytes(b"A" * 8000)
+        b.write_bytes(b"B" * 9000)
+        from blobtrack.cli.commands import cmd_add, cmd_commit, cmd_checkout
+        cmd_add(str(a))
+        cmd_add(str(b))
+        cmd_commit("two files")
+        from blobtrack.storage.index_db import IndexDB
+        db = IndexDB(tmp_path / ".blobtrack" / "index.db")
+        c1 = db.list_commits()[0]["commit_hash"]
+        db.close()
+        # Modify only a
+        a.write_bytes(b"AX" * 4000)
+        cmd_add(str(a))
+        cmd_commit("modify a")
+        # Checkout first commit -> both files restored
+        cmd_checkout(c1)
+        assert a.read_bytes() == b"A" * 8000
+        assert b.read_bytes() == b"B" * 9000
+
+
+class TestGCIntegration:
+    def test_gc_no_orphans(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        cmd_init(cwd=tmp_path)
+        f = tmp_path / "g.bin"
+        f.write_bytes(b"gc test " * 3000)
+        from blobtrack.cli.commands import cmd_add, cmd_commit, cmd_gc
+        cmd_add(str(f))
+        cmd_commit("v1")
+        # No orphans yet
+        cmd_gc()  # should report no orphans, not fail
+        from blobtrack.storage.local_store import LocalStore
+        from blobtrack.storage.index_db import IndexDB
+        assert len(LocalStore(tmp_path / ".blobtrack" / "objects").list_chunks()) >= 1
+        db = IndexDB(tmp_path / ".blobtrack" / "index.db")
+        assert len(db.get_orphan_chunks()) == 0
+        db.close()
+
+    def test_gc_deletes_orphan(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        cmd_init(cwd=tmp_path)
+        f = tmp_path / "g2.bin"
+        f.write_bytes(b"gc orphan " * 2000)
+        from blobtrack.cli.commands import cmd_add, cmd_commit, cmd_gc
+        cmd_add(str(f))
+        cmd_commit("v1")
+        from blobtrack.storage.local_store import LocalStore
+        ls = LocalStore(tmp_path / ".blobtrack" / "objects")
+        # Create orphan directly
+        ls.store_chunk("deadbeef" * 8, b"orphan")
+        assert ls.has_chunk("deadbeef" * 8)
+        cmd_gc()
+        assert not ls.has_chunk("deadbeef" * 8)
+
+    def test_gc_requires_repo(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        from blobtrack.cli.commands import cmd_gc
+        with pytest.raises(SystemExit) as exc:
+            cmd_gc()
+        assert exc.value.code == 1
+
+
+# ---------------------------------------------------------------------------
+# Stub tests - future commands must exit 1 with controlled message
+# ---------------------------------------------------------------------------
+
+class TestStubs:
+    def test_push_pull_stubs(self):
+        from blobtrack.cli.commands import cmd_push, cmd_pull
+
+        for fn, arg in [(cmd_push, "origin"), (cmd_pull, "origin")]:
             with pytest.raises(SystemExit) as exc:
-                if arg is None:
-                    fn()
-                else:
-                    fn(arg)
+                fn(arg)
             assert exc.value.code == 1

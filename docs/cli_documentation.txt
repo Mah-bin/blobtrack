@@ -89,10 +89,9 @@ MODULE OVERVIEW:
     parses the user's input and calls the appropriate function here.
 
     Member 1 - CLI & Integration Lead
-    Phase 1+2+3: cmd_init(), cmd_add() and cmd_commit() fully implemented.
-    Remaining commands (log/checkout/push/pull/gc) are controlled
-    placeholders that print "not available yet" messages until Member 4
-    delivers Increment 4/5.
+    Phase 1-4: cmd_init(), cmd_add(), cmd_commit(), cmd_log(),
+    cmd_checkout() and cmd_gc() fully implemented. Remaining commands
+    (push/pull) are controlled placeholders for Increment 5.
 
 HELPER: _print_success(msg: str) -> None
     Prints a green success message using the Rich library.
@@ -260,14 +259,63 @@ FUNCTION: cmd_commit(message: str) -> None
     Staged implementation: first commit -> second parent -> delta (3C-3E).
 
 FUNCTION: cmd_log() -> None
-    STUB — Increment 4.
-    Will be implemented when the storage layer is available.
-    Currently prints: "log functionality is not available yet"
+    Increment 4 — Fully implemented. Displays commit history newest first
+    via Member 4 IndexDB.
+
+    What it does:
+        1. Verify repo exists via _find_repo_root() else "not a repo"
+        2. Open IndexDB(repo/.blobtrack/index.db) and call list_commits()
+           which returns SELECT commit_hash,parent_hash,message,author,
+           timestamp,merkle_root_hash,tree_data ORDER BY timestamp DESC
+        3. If no commits -> "No commits yet. Use 'blobtrack commit -m'"
+           (exit 0, read-only)
+        4. Render via Rich table (if available) columns Hash[:12]|Message|
+           Author|Date|Parent[:12] else plain print commit blocks. Date
+           formatted via datetime.fromtimestamp. Shows merkle_root parent
+           chain. After table prints "Displayed N commit(s)".
+
+    Safety: read-only, never modifies index.db/objects, handles empty
+    repo, shows newest first per IndexDB ORDER BY timestamp DESC, preserves
+    core/storage untouched.
+
+    Returns: exit 0, prints to stdout.
 
 FUNCTION: cmd_checkout(commit_hash: str) -> None
-    STUB — Increment 4.
-    Will be implemented when the storage layer is available.
-    Currently prints: "checkout functionality is not available yet"
+    Increment 4 — Fully implemented. Reconstructs files from commit via
+    Member 4 IndexDB/LocalStore + Member 2 packer.decompress.
+
+    What it does (Policy A: restore tracked, leave untracked alone):
+        1. Validate hash via re.fullmatch [0-9a-f]{6,64} else "invalid format"
+           and repo exists else "not a repo"
+        2. Resolve short hash: get_commit(hash) if None then prefix search
+           list_commits() startswith, ambiguous -> error, not found -> error
+        3. Get refs via get_commit_chunk_refs(hash) ordered file_path ASC,
+           chunk_order ASC; if none -> "has no file chunk references"
+        4. Group by file_path, sorted chunk_order, for each file:
+           out_path = repo_root / file_path (posix), mkdir parents 0o700
+           tmp = mkstemp(parent, .checkout_) then for each ref:
+               compressed = LocalStore.retrieve_chunk(hash) else
+               "required chunk ... missing" exit 1
+               decompressed = packer.decompress(compressed) else exit 1
+               verify len(decompressed)==chunk_length else mismatch exit 1
+               write decompressed, track total_bytes
+           Verify expected_total vs actual size, then atomic replace(tmp)
+           via Path.replace() - backup not needed, Policy A leaves c.txt
+           not in commit alone.
+        5. Verify integrity: optional hash_file_streaming vs file_hash if
+           available; currently size check + decompress success is gate
+        6. Output via Rich: "Checked out <12> - restored N file(s), M chunks,
+           total_bytes" + "Commit: \"msg\" parent -"
+
+    Safety: uses chunk_order not row order, decompresses via Member 2,
+    never writes .blobtrack/objects directly, handles missing chunk
+    cleanly exit 1 not corrupt file, atomic tmp+replace prevents half file,
+    binary safe, multi-file a.txt+b.txt grouped correctly. Tested
+    v1 0aaf0e -> checkout v1 exact SHA-256 == expected, v2 fd25ba -> checkout
+    v2 exact, multi-file a.txt+b.txt -> modify a -> a changed b unchanged.
+
+    Args: commit_hash: full 64 or short 12 hex prefix
+    Returns: exit 0 on success, 1 on invalid/not found/missing chunk.
 
 FUNCTION: cmd_push(remote: str) -> None
     STUB — Increment 5.
@@ -280,6 +328,31 @@ FUNCTION: cmd_pull(remote: str) -> None
     Currently prints: "pull functionality is not available yet"
 
 FUNCTION: cmd_gc() -> None
-    STUB — Increment 4.
-    Will be implemented when the storage layer is available.
-    Currently prints: "gc functionality is not available yet"
+    Increment 4 — Fully implemented. Garbage collects orphan chunks via
+    Member 4 IndexDB + LocalStore.
+
+    What it does:
+        1. Verify repo via _find_repo_root() else "not a repo"
+        2. Open IndexDB + LocalStore(repo/.blobtrack/objects)
+        3. active = IndexDB.get_active_chunk_hashes() -> SELECT DISTINCT
+           chunk_hash FROM chunk_refs (all retained commits, not just latest)
+        4. stored = LocalStore.list_chunks() (objects dir files)
+        5. orphan_list = IndexDB.get_orphan_chunks() -> LEFT JOIN chunks
+           WHERE r.chunk_hash IS NULL
+        6. deleted_fs, freed = LocalStore.garbage_collect(active) -> scans
+           stored, deletes not in active, returns (deleted,freed_bytes)
+        7. deleted_db = IndexDB.delete_chunk_records(remaining_orphans) after
+           FS GC (idempotent, handles same hash)
+        8. Output: if 0 -> "no orphan chunks found - all 0 orphans, 0 bytes"
+           else "deleted N orphan chunk(s) from objects, M DB record(s),
+           freed X bytes. Active: N, stored before: M" + dim Active count.
+           Verifies checkout C1/C2/C3 still works after GC (active preserved).
+
+    Safety: only deletes orphans not in active set (any retained commit),
+    not just current commit; uses Member 4 active/orphan helpers, not
+    manual "for object not in current_commit" loop (dangerous). Handles
+    empty orphans, reports freed bytes, never deletes active. Tested
+    store deadbeef*8 orphan -> gc deleted 1 freed 11 Active 2 -> has_chunk
+    False, second gc 0, checkout C1/C2 still exact.
+
+    Returns: exit 0, prints via Rich.

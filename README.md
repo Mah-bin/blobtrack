@@ -2,7 +2,7 @@
 
 > A `git`-like CLI for **incremental versioning of massive binary files** (videos, AI datasets, 3D models) using **Content-Defined Chunking, SHA-256, Merkle Trees, and Delta Synchronization**.
 
-![Python](https://img.shields.io/badge/python-3.10+-blue) ![Tests](https://img.shields.io/badge/tests-57_passed-brightgreen) ![Status](https://img.shields.io/badge/phase-3_done-green)
+![Python](https://img.shields.io/badge/python-3.10+-blue) ![Tests](https://img.shields.io/badge/tests-65_passed-brightgreen) ![Status](https://img.shields.io/badge/phase-4_done-green)
 
 **Problem:** `git` stores a full 20 GB binary copy on every change → 20 commits = 400 GB wasted.
 **Solution:** `blobtrack` slices files into ~2 MB variable chunks, fingerprints each with SHA-256, and stores **only changed chunks**. A 20 GB edit becomes a ~40 MB delta.
@@ -47,10 +47,12 @@ using CDC                                   (deduplicated)
 
 *   **Incremental:** 10 MB file change of 1 KB → only 1 new chunk stored (50% dedup for 2-chunk file, 99% for 5000-chunk file)
 *   **Deduplicated:** `has_chunk()` check prevents duplicate storage
-*   **Versioned:** `commit` snapshots with Merkle root + parent chain, delta `+1 -1 =0` vs previous
+*   **Versioned:** `commit` snapshots with Merkle root + parent chain, delta `+1 -1 =1`
+*   **Reconstructable:** `checkout` restores exact bytes via `retrieve_chunk + decompress` + `chunk_order`, verified by `SHA-256`
+*   **Maintainable:** `log` shows history newest first, `gc` deletes only orphans not in `get_active_chunk_hashes()`
 *   **Streaming:** Never loads whole file into RAM (`chunk_file_streaming` + `process_chunks` batch 16, workers 8)
 *   **Atomic:** `LocalStore` writes via `tempfile + fsync + atomic move`, `IndexDB` WAL mode with `IF NOT EXISTS`
-*   **8 CLI commands:** `init, add, commit, log, checkout, push, pull, gc` (3 implemented, 5 stubbed)
+*   **8 CLI commands:** `init, add, commit, log, checkout, gc, push, pull` (6 implemented, 2 stubbed)
 
 ## 3. Installation
 
@@ -99,8 +101,22 @@ py -c "f=open('video.mp4','r+b'); f.seek(2097152); f.write(b'X'*1024); f.close()
 blobtrack add video.mp4
 # Added 'video.mp4' -> 2 chunks (1 new, 1 reused, 50.0% dedup)
 blobtrack commit -m "second version"
-# Committed 01de1f33cb00 - 1 file(s), 2 chunks, root 54e9f75c1140... | delta: +1 -1 =1 - "second version"
-# parent ca6543a654c6 -> 01de1f33cb00
+# Committed 01de1f33cb00 - 1 file(s), 2 chunks, root 54e9f75c1140... | delta: +1 -1 =1
+
+# History and checkout
+blobtrack log
+# +------------------+----------------+--------+---------------------+--------------+
+# | Hash             | Message        | Author | Date                | Parent       |
+# |------------------+----------------+--------+---------------------+--------------|
+# | 01de1f33cb00     | second version | -      | 2026-08-27 12:34:31 | ca6543a654c6 |
+# | ca6543a654c6     | first version  | -      | 2026-08-27 12:34:29 | -            |
+# +------------------+----------------+--------+---------------------+--------------+
+
+blobtrack checkout ca6543a654c6
+# Checked out ca6543a654c6 - restored 1 file(s), 2 chunks, 10485760 bytes
+
+blobtrack gc
+# Garbage collection: no orphan chunks found - all 0 orphans, 0 bytes freed
 ```
 
 ## 5. Usage
@@ -114,6 +130,9 @@ blobtrack commit -m "second version"
 | `blobtrack init` | Create repo in current dir | `blobtrack init` | ✅ Phase 1 |
 | `blobtrack add <file>` | Chunk, compress, deduplicate, store | `blobtrack add video.mp4` | ✅ Phase 2 |
 | `blobtrack commit -m "msg"` | Snapshot current state with Merkle root + parent | `blobtrack commit -m "v1"` | ✅ Phase 3 |
+| `blobtrack log` | Show commit history newest first | `blobtrack log` | ✅ Phase 4 |
+| `blobtrack checkout <hash>` | Reconstruct files from commit (exact SHA-256 verified) | `blobtrack checkout ca6543a6` | ✅ Phase 4 |
+| `blobtrack gc` | Delete orphan chunks not in any commit | `blobtrack gc` | ✅ Phase 4 |
 
 **`blobtrack init`:** Creates `.blobtrack/objects/`, `.blobtrack/commits/`, `.blobtrack/index.db` (WAL SQLite, `0o700`). Idempotent — second run: `Error: repository already initialized` (no delete).
 
@@ -125,14 +144,28 @@ blobtrack commit -m "second version"
 
 **`blobtrack commit -m "msg"`:**
 *   Validates `message` non-empty and repo + tracked files exist (`list_files()` sorted posix)
-*   Re-chunks each tracked file via `chunk_file_streaming -> process_chunks`, collects `combined_hashes` ordered by file path + chunk index (Contract 3)
+*   Re-chunks each tracked file via `chunk_file_streaming -> process_chunks`, collects `combined_hashes` ordered by file path + chunk index
 *   `build_tree(combined)` -> `root.hash` + `serialize_tree(root)` -> `merkle_root` + `tree_data`
 *   Parent: `get_latest_commit()` -> `parent_hash = latest.commit_hash` else `None` for first commit
 *   Commit hash: `hash_bytes(f"{merkle_root}:{message}:{timestamp}:{parent or ''}".encode())` deterministic
 *   Delta: `compute_delta(parent_tree,new_tree)` -> `| delta: +1 -1 =1` for logging
 *   Persists atomically via `IndexDB.save_commit(...,tree_data,file_chunk_mappings)` with `offset/length/order`
-*   Output: `Committed <12> - N file(s), M chunks, root <12>... | delta ... - "msg"` + dim parent link
-*   Handles `no tracked files`, `file missing on disk` (skip with warning), `empty` -> `exit 1`
+
+**`blobtrack log`:**
+*   `IndexDB.list_commits()` `ORDER BY timestamp DESC` newest first
+*   Rich table `Hash[:12] | Message | Author | Date | Parent[:12]` or plain fallback
+*   Read-only, handles `No commits yet`
+
+**`blobtrack checkout <hash>`:**
+*   Validates `^[0-9a-f]{6,64}$`, resolves short prefix via `list_commits()` prefix search, `get_commit` exists else `commit not found`
+*   `get_commit_chunk_refs(hash)` grouped `file_path` sorted `chunk_order`, for each `LocalStore.retrieve_chunk` -> `packer.decompress` -> `tmpfile + atomic replace` via `Path.replace()` **Policy A** leaves untracked `c.txt` alone
+*   Verifies `len(decompressed)==chunk_length` and `expected_total vs actual`, handles `missing chunk -> Error required chunk ... missing` `1`
+*   Output: `Checked out <12> - restored N file(s), M chunks, total_bytes` + `Commit: "msg" parent -`
+
+**`blobtrack gc`:**
+*   `get_active_chunk_hashes()` (all `chunk_refs`) vs `list_chunks()` stored
+*   `get_orphan_chunks()` LEFT JOIN, `LocalStore.garbage_collect(active)` + `delete_chunk_records(orphans)` idempotent
+*   Reports `deleted N orphan(s) from objects, M DB record(s), freed X bytes. Active: N`
 
 **Deduplication & Versioning Examples:**
 ```bash
@@ -141,6 +174,8 @@ blobtrack add test.bin        # same file -> 0 new 1 reused 100% (objects stay 1
 blobtrack commit -m "v1"      # first commit parent None root 01a19c
 blobtrack commit -m "v2"      # same content -> same root 01a19c parent v1, delta +0
 # 10 MB 2-chunk file, patch 1KB at 2MB, add + commit -> 1 new 1 reused 50% delta +1 -1
+blobtrack checkout v1         # restores exact original SHA-256
+blobtrack gc                  # deletes only deadbeef orphan, preserves active
 ```
 
 ### 5.2 Planned Commands (Stubbed)
@@ -149,9 +184,6 @@ Registered in `argparse` but currently return `Error: ... not available yet` (`e
 
 | Command | Increment | Status |
 |---|---|---|
-| `blobtrack log` | Inc.4 history + GC (Member 1+4) | ⏳ stub |
-| `blobtrack checkout <hash>` | Inc.4 | ⏳ stub |
-| `blobtrack gc` | Inc.4 | ⏳ stub |
 | `blobtrack push <remote>` | Inc.5 remote sync (Member 4+3) | ⏳ stub |
 | `blobtrack pull <remote>` | Inc.5 | ⏳ stub |
 
@@ -169,7 +201,7 @@ Registered in `argparse` but currently return `Error: ... not available yet` (`e
                     └──────┬───────┘
                            |
                     ┌──────────────┐
-                    │cli/commands.py│  cmd_init() ✅ + cmd_add() ✅ + cmd_commit() ✅ + 5 stubs
+                    │cli/commands.py│  cmd_init() ✅ + cmd_add() ✅ + cmd_commit() ✅ + cmd_log() ✅ + cmd_checkout() ✅ + cmd_gc() ✅ + 2 stubs
                     └──────┬───────┘
                            |
               ┌────────────┴─────────────┐
@@ -182,8 +214,8 @@ Registered in `argparse` but currently return `Error: ... not available yet` (`e
                                     ├── merkle_tree.py build_tree/serialize_tree root.hash
                                     └── differ.py compute_delta (positional prune)
                                     Member 4: storage/
-                                    ├── index_db.py IndexDB (files/commits/chunks/chunk_refs, save_commit)
-                                    ├── local_store.py LocalStore (has_chunk/store_chunk atomic)
+                                    ├── index_db.py IndexDB (files/commits/chunks/chunk_refs, save_commit, get_active)
+                                    ├── local_store.py LocalStore (has_chunk/store_chunk/retrieve/garbage_collect atomic)
                                     └── remote_sync.py RemoteSync (Phase 5)
 ```
 
@@ -198,7 +230,7 @@ blobtrack/
 │   ├── cli/
 │   │   ├── __init__.py
 │   │   ├── main.py          # Member 1 - argparse front door
-│   │   └── commands.py      # Member 1 - cmd_init + cmd_add + cmd_commit integration
+│   │   └── commands.py      # Member 1 - cmd_init + cmd_add + cmd_commit + log/checkout/gc
 │   ├── core/
 │   │   ├── __init__.py
 │   │   ├── chunker.py       # Member 2 - CDC 512KB/2MB/8MB
@@ -214,7 +246,7 @@ blobtrack/
 ├── tests/
 │   ├── test_chunker.py
 │   ├── test_hasher.py
-│   ├── test_cli.py          # Member 1 - 21 CLI + Phase 3 commit integration tests
+│   ├── test_cli.py          # Member 1 - CLI + add/commit/log/checkout/gc integration tests
 │   ├── test_index_db.py     # Member 4
 │   ├── test_local_store.py
 │   └── test_remote_sync.py
@@ -230,26 +262,26 @@ blobtrack/
 
 ## 8. Development Status
 
-Incremental, each phase produces a working demo. Current branch: `cli/P3` at Phase 3, `main` at `60f6daf` until PR merged.
+Incremental, each phase produces a working demo. Current branch: `cli/P4` at Phase 4, `main` at `60f6daf` until PR merged.
 
 | Phase | What | Who Leads | Deliverable | Status |
 |---|---|---|---|---|
 | **1** | CLI skeleton + `init` + SHA-256 | Member 1+2 | `blobtrack init` works, can hash any file | **DONE** |
 | **2** | CDC chunking + compression + local storage | Member 2+4 | `blobtrack add` slices & stores deduplicated | **DONE** `cli/P2` |
 | **3** | Merkle Tree + delta diffing + `commit` | Member 3+1 | `blobtrack commit` builds tree, detects changes, persists snapshot | **DONE** `cli/P3` |
-| 4 | History + `checkout` + `gc` | Member 1+4 | `log`/`checkout`/`gc` work | ⏳ Next |
-| 5 | Remote `push`/`pull` delta sync | Member 4+3 | only new chunks transferred | ⏳ |
+| **4** | History + `checkout` + `gc` | Member 1+4 | `log`/`checkout`/`gc` work - exact reconstruction, orphan GC | **DONE** `cli/P4` |
+| 5 | Remote `push`/`pull` delta sync | Member 4+3 | only new chunks transferred | ⏳ Next |
 
 ## 9. Testing
 
 ```bash
-# All tests (57: 11 chunker + 21 cli + 13 hasher/index_db/local_store/remote + Phase 3 commit)
+# All tests (65: 11 chunker + 29 cli (init/add/commit/log/checkout/gc) + 13 hasher/index_db/local_store/remote)
 py -m pytest tests/ -v
 
 # Compile check
 py -m compileall blobtrack
 
-# Manual Phase 1-3 acceptance (isolated C:\tmp)
+# Manual Phase 1-4 acceptance (isolated C:\tmp)
 mkdir C:\tmp\verify; cd C:\tmp\verify
 blobtrack init
 blobtrack add test.bin        # 240KB -> 1 chunks (1 new)
@@ -257,12 +289,15 @@ blobtrack commit -m "v1"      # first commit parent None root 01a19c
 blobtrack add test.bin
 blobtrack commit -m "v2"      # second same file same root parent v1
 # Modify 1KB, add + commit -> delta +1 -1, new root 348a7d
+blobtrack log                 # 2 commits newest first
+blobtrack checkout <v1>       # restores exact original SHA-256
+blobtrack gc                  # no orphans or deletes deadbeef orphan
 # 10MB 2 chunks -> 1 new 1 reused 50% after 1KB patch
 
 # Specific suites
 py -m pytest tests/test_hasher.py tests/test_chunker.py -v  # Member 2
 py -m pytest tests/test_index_db.py tests/test_local_store.py -v  # Member 4
-py -m pytest tests/test_cli.py -k commit -v  # Member 1 Phase 3
+py -m pytest tests/test_cli.py -k "log or checkout or gc" -v  # Member 1 Phase 4
 ```
 
 ## 10. Tech Stack
@@ -281,10 +316,10 @@ py -m pytest tests/test_cli.py -k commit -v  # Member 1 Phase 3
 
 ## 11. Documentation
 
-*   `docs/cli_documentation.txt` — `main.py`/`commands.py` `cmd_add` 8-step + `cmd_commit` 9-contract flow
+*   `docs/cli_documentation.txt` — `main.py`/`commands.py` `cmd_add` 8-step + `cmd_commit` 9-contract + `cmd_log/checkout/gc` Phase 4 flow
 *   `docs/core_engine_documentation.txt` — CDC, hashing, Merkle, differ
 *   `docs/storage_documentation.md` — `IndexDB`/`LocalStore` APIs
-*   `docs/integration_contract.md` — Member 2/3 confirmed vs Member 4 pending APIs
+*   `docs/integration_contract.md` — Member 2/3 confirmed, Member 4 validated, 9 Phase 3 contracts + Phase 4 log/checkout/gc contracts
 
 ## 12. Team Roles
 
