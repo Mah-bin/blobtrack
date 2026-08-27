@@ -40,33 +40,48 @@ $env:Path += ";C:\Users\Admin\AppData\Local\Programs\Python\Python314\Scripts"
 
 ---
 
-## Usage — Current Commands (Phase 1)
+## Usage — Current Commands (Phase 2)
 
-### Implemented — Increment 1
+### Implemented — Increments 1 & 2
 
 ```bash
 blobtrack --help          # Show all 8 commands
 blobtrack --version       # Show version
-blobtrack init            # Create .blobtrack repository in current directory
+blobtrack init            # Create .blobtrack repository
+blobtrack add <file>      # Chunk, compress, deduplicate and store file
 ```
 
 ```bash
-# Example
+# Example - Phase 1 init
 mkdir my_project && cd my_project
 blobtrack init
 # -> Initialized empty blobtrack repository in ...\.blobtrack
-# Creates: .blobtrack/objects/ , .blobtrack/commits/ , .blobtrack/index.db
+# Creates: .blobtrack/objects/ , .blobtrack/commits/ , .blobtrack/index.db (WAL SQLite)
+
+# Example - Phase 2 add (Member 2 chunker + Member 4 storage)
+# Create a test file
+py -c "open('video.mp4','wb').write(b'A'*5242880 + b'B'*5242880)" # 10MB
+blobtrack add video.mp4
+# -> Added 'video.mp4' -> 2 chunks (2 new, 0 reused, 0.0% dedup) [10485760 -> 357 bytes compressed]
+
+blobtrack add video.mp4
+# -> Added 'video.mp4' -> 2 chunks (0 new, 2 reused, 100.0% dedup) - no duplicate objects stored
+
+# Modify 1KB in middle, re-add
+py -c "f=open('video.mp4','r+b'); f.seek(2097152); f.write(b'X'*1024); f.close()"
+blobtrack add video.mp4
+# -> Added 'video.mp4' -> 2 chunks (1 new, 1 reused, 50.0% dedup) - only changed chunk stored
 ```
 
 `blobtrack init` is idempotent — second run reports `Error: repository already initialized` and does not delete data.
+`blobtrack add` deduplicates via `has_chunk()` - identical SHA-256 chunks are stored once. Streams file via `chunk_file_streaming` + `process_chunks` (16 batch, 8 workers) so 10GB files never load fully into RAM.
 
 ### Planned — Later Increments (currently stubbed)
 
-These commands are **registered** in the CLI but return `Error: ... not available yet` until their increments are implemented:
+These commands are **registered** but return `Error: ... not available yet` until their increments are implemented:
 
 | Command | Increment | Status |
 |---|---|---|
-| `blobtrack add <file>` | Inc.2 - CDC + compression + local storage (Member 2+4) | stub |
 | `blobtrack commit -m "msg"` | Inc.3 - Merkle Tree + delta diffing (Member 3+1) | stub |
 | `blobtrack log` | Inc.4 - history + checkout + GC (Member 1+4) | stub |
 | `blobtrack checkout <hash>` | Inc.4 | stub |
@@ -90,23 +105,24 @@ Do not consider these functional until their delivering increment passes `py -m 
          └──────┬───────┘
                 |
          ┌──────────────┐
-         │ cli/commands.py │  cmd_init() fully implemented, others integration stubs
+         │ cli/commands.py │  cmd_init() + cmd_add() implemented, others integration stubs
          └──────┬───────┘
                 |
     ┌───────────┴───────────┐
     ▼                       ▼
  .blobtrack/            Member 2: core/
- objects/               chunker.py (fastcdc CDC 512KB/2MB/8MB)
- commits/               hasher.py (SHA-256 streaming, parallel)
- index.db (empty        packer.py (Zstandard)
- container Phase 1)
-                Storage (Member 4 - pending)
-                 local_store.py, index_db.py (WAL SQLite)
+ objects/ (LocalStore)  chunker.py (fastcdc CDC 512KB/2MB/8MB) chunk_file_streaming
+ commits/               hasher.py (SHA-256 + process_chunks) ProcessedChunk
+ index.db (IndexDB      packer.py (Zstandard compress) + hasher streaming
+ WAL SQLite)            Member 4: storage/
+                        index_db.py (IndexDB WAL, files/commits/chunks/chunk_refs)
+                        local_store.py (LocalStore atomic has_chunk/store_chunk)
+                        remote_sync.py (Phase 5)
 ```
 
 **Member 1 (CLI & Integration Lead)** owns `cli/main.py`, `cli/commands.py`, `setup.py`, `README.md` and wires Member 2/3/4 modules.
 
-See `docs/integration_contract.md` for confirmed vs pending APIs.
+See `docs/integration_contract.md` for confirmed vs pending APIs and `docs/cli_documentation.txt` for Phase 2 `cmd_add` 8-step flow.
 
 ---
 
@@ -115,32 +131,36 @@ See `docs/integration_contract.md` for confirmed vs pending APIs.
 | Phase | What | Who Leads | Deliverable |
 |---|---|---|---|
 | **1** | CLI skeleton + `init` + SHA-256 | Member 1+2 | `blobtrack init` works, can hash any file - **DONE** |
-| 2 | CDC chunking + compression + local storage | Member 2+4 | `blobtrack add` slices & stores deduplicated chunks |
+| **2** | CDC chunking + compression + local storage | Member 2+4 | `blobtrack add` slices & stores deduplicated chunks - **DONE** (cli/P2) |
 | 3 | Merkle Tree + delta diffing + `commit` | Member 3+1 | `blobtrack commit` detects changes |
 | 4 | History + `checkout` + `gc` | Member 1+4 | `log`, `checkout`, `gc` work |
 | 5 | Remote `push`/`pull` delta sync | Member 4+3 | only new chunks transferred |
 
-Every increment produces a working demo. Current branch: `main` at Phase 1.
+Every increment produces a working demo. Current branch: `cli/P2` at Phase 2, `main` at `60f6daf` (Phase 1) until PR merged.
 
 ---
 
 ## Testing
 
 ```bash
-# All tests (currently 44: 11 chunker + 21 cli + 12 hasher)
+# All tests (currently 57: 11 chunker + 21 cli + 13 hasher/index_db/local_store/remote)
 py -m pytest tests/ -v
 
 # Compile check
 py -m compileall blobtrack
 
-# Manual Phase 1 acceptance (in isolated C:\tmp)
+# Manual Phase 1-2 acceptance (in isolated C:\tmp)
 mkdir C:\tmp\verify; cd C:\tmp\verify
 blobtrack init
-# -> .blobtrack/objects, .blobtrack/commits, .blobtrack/index.db
-blobtrack init  # second -> already initialized
+# -> .blobtrack/objects, .blobtrack/commits, .blobtrack/index.db (WAL)
+blobtrack add test.bin # 240KB -> 1 chunks (1 new)
+blobtrack add test.bin # second -> 0 new 1 reused 100% dedup
+# Modify 1KB, re-add -> only changed chunk new (10MB -> 1 new 1 reused 50%)
 
 # Verify hashing still works (Member 2)
 py -m pytest tests/test_hasher.py tests/test_chunker.py -v
+# Verify storage (Member 4)
+py -m pytest tests/test_index_db.py tests/test_local_store.py -v
 ```
 
 ---
