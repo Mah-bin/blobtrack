@@ -63,15 +63,58 @@ storage/ — future increments
 
 ---
 
-## Member 3 — Merkle Tree & Delta — FUTURE (Increment 3)
+## Member 3 — Merkle Tree & Delta — CONFIRMED (Increment 3) — Phase 3 Active
+
+Source: `blobtrack/core/merkle_tree.py:59` `differ.py:17` — verified 43d89d0, 60f6daf.
 
 ```
-core/merkle_tree.py — NOT YET (Increment 3)
-  Expected: class MerkleNode(left, right, hash), build_tree(chunk_hashes), serialize/deserialize
+core/merkle_tree.py — CONFIRMED
+  class MerkleNode(hash, left, right, is_leaf)  # hash: str, left/right: Optional[MerkleNode]
+  _combine_hashes(left_hash: str, right_hash: str) -> str  # sha256(left+right)
+  build_tree(chunk_hashes: List[str]) -> Optional[MerkleNode]  # ordered list, odd level promotes not duplicates, single chunk is root
+  serialize_tree(root: Optional[MerkleNode]) -> str  # JSON string
+  deserialize_tree(data: str) -> Optional[MerkleNode]
+  collect_leaf_hashes(root: Optional[MerkleNode]) -> List[str]  # left-to-right
 
-core/differ.py — NOT YET (Increment 3)
-  Expected: compute_delta(old_tree, new_tree) -> DeltaManifest(added, removed, unchanged)
+core/differ.py — CONFIRMED
+  compute_delta(old_tree: Optional[MerkleNode], new_tree: Optional[MerkleNode]) -> Dict[str,List[str]]  # positional top-down prunes matching hash, returns {added,removed,unchanged}
+  compute_delta_by_set(old_tree, new_tree) -> Dict  # set-arithmetic exact for insert shifts, use for push/pull
 ```
+
+**Contract:** Member 3 — please do not change these signatures without notifying Member 1. `cmd_commit()` depends on `build_tree` + `compute_delta`.
+
+### Phase 3 — Commit Contracts — 9 Contracts — PENDING TEAM APPROVAL for 2 items
+
+**Contract 1 — Current state:** `cmd_commit()` obtains current state via `IndexDB.list_files()` sorted by `path` posix, then re-chunks each tracked file on disk via `chunk_file_streaming + process_chunks` to get ordered chunk hashes. Files missing on disk are skipped with warning.
+
+**Contract 2 — Repository Merkle representation — CURRENT IMPLEMENTATION (needs explicit team approval):**
+```
+Repository state:
+- Files sorted lexicographically by repo-relative posix path (e.g., a.txt before b.txt)
+- Chunks within each file sorted by chunk_order/index (0,1,2...)
+- Chunk hashes concatenated in that deterministic order -> combined_hashes: List[str]
+- combined_hashes -> build_tree() -> repository-level Merkle root
+- Merkle root represents entire tracked repository snapshot
+```
+Alternative considered: per-file roots then hash of file roots — CURRENT chooses single repo tree over concatenated hashes. Team to confirm.
+
+**Contract 3 — Chunk ordering:** File path sorted + chunk.index order, not DB insertion order or set.
+
+**Contract 4 — Merkle API:** `build_tree(combined_hashes)` -> `root.hash` is merkle_root, `serialize_tree(root)` is tree_data JSON string.
+
+**Contract 5 — Delta API:** `compute_delta(parent_tree, new_tree)` positional, for `push/pull` use `compute_delta_by_set` per Member 3 — Member 3 to confirm.
+
+**Contract 6 — Parent:** `first commit parent=None`, `later parent = get_latest_commit().commit_hash`.
+
+**Contract 7 — Commit hash — CURRENT IMPLEMENTATION (needs explicit team approval):**
+```
+commit_hash = hash_bytes(f"{merkle_root}:{message}:{timestamp}:{parent or ''}".encode())
+```
+SHA-256 of `merkle_root : message : timestamp : parent`. Includes timestamp for uniqueness, parent for chain. Team to confirm if `author` or `tree_data` should be included instead. Currently implemented and verified working — freeze only after team approval.
+
+**Contract 8 — save_commit():** `IndexDB.save_commit(commit_hash,message,parent_hash,author,timestamp,merkle_root_hash,tree_data,file_chunk_mappings)` where `file_chunk_mappings` is List[Dict{file_path,chunk_hash,chunk_offset,chunk_length,chunk_order,size_uncompressed,size_compressed}] with FK CASCADE. Member 4 to confirm.
+
+**Contract 9 — Multi-file semantics:** One commit contains coherent snapshot of ALL tracked files at commit time (files sorted, combined hashes). Changing `a.txt` only, `b.txt` unchanged is still snapshot of both. Tested with `a.txt`+`b.txt` two-file repo — pending final multi-file verification.
 
 Member 1 will integrate via `cmd_commit()` only after Increment 3.
 

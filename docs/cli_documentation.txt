@@ -218,13 +218,16 @@ FUNCTION: cmd_commit(message: str) -> None
            parent_hash = latest.commit_hash else None. Deserialize parent
            tree_data via deserialize_tree(json.dumps(dict) if dict else str)
            for delta. First commit parent None.
-        6. Commit hash (Contract 7): deterministic SHA-256 of
+        6. Commit hash (Contract 7): CURRENT IMPLEMENTATION pending team
+           approval - deterministic SHA-256 of
            f"{merkle_root}:{message}:{timestamp}:{parent or ''}".encode()
-           via hash_bytes() -> commit_hash, timestamp = time.time()
+           via hash_bytes() -> commit_hash, timestamp = time.time(). Team
+           to confirm if author/tree_data should be included. Currently
+           verified working for log/checkout chain, freeze after approval.
         7. Delta for logging (Contract 5): if parent_tree exists
            compute_delta(parent_tree,new_tree) -> {added,removed,unchanged}
            display "| delta: +N -M =K" (positional prune, by_set reserved
-           for push/pull per Member 3)
+           for push/pull per Member 3 - Member 3 to confirm)
         8. Persist atomically via Member 4 IndexDB.save_commit(
            commit_hash,message,parent_hash,author=None,timestamp,
            merkle_root_hash,tree_data,file_chunk_mappings) which inserts
