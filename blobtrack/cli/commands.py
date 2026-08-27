@@ -266,8 +266,172 @@ def cmd_add(filepath: str) -> None:
 
 
 def cmd_commit(message: str) -> None:
-    _print_error("commit functionality is not available yet (Increment 3 - requires Merkle Tree & storage)")
-    sys.exit(1)
+    """
+    Phase 3: Build Merkle Tree from current tracked files, compute delta vs
+    parent, and persist commit via Member 4 IndexDB.
+    Increment 3: Merkle Tree + delta diffing + commit (Member 3+1)
+    """
+    if not message or not message.strip():
+        _print_error("commit message cannot be empty. Use -m \"message\"")
+        sys.exit(1)
+
+    repo_root = _find_repo_root()
+    if repo_root is None:
+        _print_error("not a blobtrack repository. Run 'blobtrack init' first.")
+        sys.exit(1)
+
+    db_path = repo_root / ".blobtrack" / "index.db"
+    objects_dir = repo_root / ".blobtrack" / "objects"
+
+    try:
+        from blobtrack.core.chunker import chunk_file_streaming
+        from blobtrack.core.hasher import hash_bytes, process_chunks
+        from blobtrack.core.merkle_tree import build_tree, deserialize_tree, serialize_tree
+        from blobtrack.core.differ import compute_delta
+        from blobtrack.storage.index_db import IndexDB
+        from blobtrack.storage.local_store import LocalStore
+    except ImportError as e:
+        _print_error(f"missing dependency for commit: {e}")
+        sys.exit(1)
+
+    try:
+        index_db = IndexDB(db_path)
+        # Ensure LocalStore exists (for has_chunk checks if needed, though add already stored)
+        local_store = LocalStore(objects_dir)
+    except Exception as e:
+        _print_error(f"failed to open repository storage: {e}")
+        sys.exit(1)
+
+    try:
+        tracked = index_db.list_files(status="tracked")
+        if not tracked:
+            # Also check if any files listed at all (maybe no status filter)
+            tracked = index_db.list_files()
+        if not tracked:
+            _print_error("no tracked files to commit. Run 'blobtrack add <file>' first.")
+            sys.exit(1)
+
+        # Sort by path for deterministic repo-level Merkle order (Contract 3 + 9)
+        tracked_sorted = sorted(tracked, key=lambda f: f["path"])
+
+        combined_hashes: list[str] = []
+        file_chunk_mappings: list[dict] = []
+        # For per-file verification and building file chunk order
+        files_in_commit = 0
+        total_chunks_in_commit = 0
+
+        for file_rec in tracked_sorted:
+            rel_posix = file_rec["path"]
+            # Resolve file on disk: try repo_root / rel_posix, fallback to absolute if outside repo
+            disk_path = repo_root / rel_posix
+            if not disk_path.is_file():
+                # Try absolute posix path (for files added outside repo)
+                alt = pathlib.Path(rel_posix)
+                if alt.is_file():
+                    disk_path = alt
+                else:
+                    _print_error(f"tracked file not found on disk, skipping: {rel_posix}")
+                    continue
+
+            try:
+                chunk_stream = chunk_file_streaming(str(disk_path))
+                # Use process_chunks to get hash + lengths without reimplementing hasher
+                for pchunk in process_chunks(chunk_stream, batch_size=16, max_workers=8):
+                    combined_hashes.append(pchunk.hash)
+                    file_chunk_mappings.append(
+                        {
+                            "file_path": rel_posix,
+                            "chunk_hash": pchunk.hash,
+                            "chunk_offset": pchunk.offset,
+                            "chunk_length": pchunk.length,
+                            "chunk_order": pchunk.index,
+                            "size_uncompressed": pchunk.length,
+                            "size_compressed": len(pchunk.compressed_data),
+                        }
+                    )
+                    total_chunks_in_commit += 1
+                files_in_commit += 1
+            except (FileNotFoundError, ValueError) as e:
+                _print_error(f"skipping {rel_posix}: {e}")
+                continue
+            except Exception as e:
+                _print_error(f"failed to process {rel_posix}: {e}")
+                sys.exit(1)
+
+        if not combined_hashes:
+            _print_error("no chunks to commit (all tracked files missing or empty)")
+            sys.exit(1)
+
+        # Build Merkle Tree repo-level (Contract 2: repo root = hash of ordered chunk hashes)
+        new_tree = build_tree(combined_hashes)
+        if new_tree is None:
+            _print_error("failed to build Merkle tree")
+            sys.exit(1)
+        merkle_root = new_tree.hash
+        tree_data = serialize_tree(new_tree)
+
+        # Parent handling (Contract 6)
+        latest = index_db.get_latest_commit()
+        parent_hash = latest["commit_hash"] if latest else None
+        parent_tree = None
+        if latest and latest.get("tree_data"):
+            try:
+                import json as _json
+
+                td = latest["tree_data"]
+                td_str = _json.dumps(td) if isinstance(td, dict) else td
+                parent_tree = deserialize_tree(td_str)
+            except Exception:
+                parent_tree = None
+
+        # Commit hash (Contract 7): deterministic SHA-256 of merkle_root + message + timestamp + parent
+        import time
+
+        timestamp = time.time()
+        # Use hash_bytes for commit hash - includes merkle_root, message, timestamp, parent for uniqueness
+        commit_hash_input = f"{merkle_root}:{message}:{timestamp}:{parent_hash or ''}".encode("utf-8")
+        commit_hash = hash_bytes(commit_hash_input)
+
+        # Delta for logging (Contract 5): use positional compute_delta, also show by_set if needed
+        delta_info = ""
+        if parent_tree is not None:
+            try:
+                delta = compute_delta(parent_tree, new_tree)
+                delta_info = f" | delta: +{len(delta['added'])} -{len(delta['removed'])} ={len(delta['unchanged'])}"
+            except Exception:
+                delta_info = ""
+
+        # Persist via Member 4 IndexDB (Contract 8)
+        try:
+            index_db.save_commit(
+                commit_hash=commit_hash,
+                message=message,
+                parent_hash=parent_hash,
+                author=None,
+                timestamp=timestamp,
+                merkle_root_hash=merkle_root,
+                tree_data=tree_data,
+                file_chunk_mappings=file_chunk_mappings,
+            )
+        except Exception as e:
+            _print_error(f"failed to save commit: {e}")
+            sys.exit(1)
+
+        _print_success(
+            f"Committed {commit_hash[:12]} - {files_in_commit} file(s), {total_chunks_in_commit} chunks, root {merkle_root[:12]}...{delta_info} - \"{message}\""
+        )
+        if parent_hash:
+            # Show parent link for history
+            if HAS_RICH and console:
+                console.print(f"[dim]parent {parent_hash[:12]} -> {commit_hash[:12]}[/dim]")
+            else:
+                print(f"parent {parent_hash[:12]} -> {commit_hash[:12]}")
+
+    finally:
+        try:
+            index_db.close()
+        except Exception:
+            pass
 
 
 def cmd_log() -> None:

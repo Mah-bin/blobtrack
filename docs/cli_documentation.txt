@@ -89,10 +89,10 @@ MODULE OVERVIEW:
     parses the user's input and calls the appropriate function here.
 
     Member 1 - CLI & Integration Lead
-    Phase 1+2: cmd_init() and cmd_add() fully implemented. Remaining
-    commands (commit/log/checkout/push/pull/gc) are controlled
-    placeholders that print "not available yet" messages until Members
-    3/4 deliver their modules in later increments.
+    Phase 1+2+3: cmd_init(), cmd_add() and cmd_commit() fully implemented.
+    Remaining commands (log/checkout/push/pull/gc) are controlled
+    placeholders that print "not available yet" messages until Member 4
+    delivers Increment 4/5.
 
 HELPER: _print_success(msg: str) -> None
     Prints a green success message using the Rich library.
@@ -192,10 +192,69 @@ FUNCTION: cmd_add(filepath: str) -> None
         _print_success or error via _print_error.
 
 FUNCTION: cmd_commit(message: str) -> None
-    STUB — Increment 3.
-    Will be implemented when Merkle Tree (Member 3) and storage (Member 4)
-    are available.
-    Currently prints: "commit functionality is not available yet"
+    Increment 3 — Fully implemented. Builds Merkle Tree from current tracked
+    files, computes delta vs parent, and persists commit via Member 3+4.
+
+    What it does (9 contracts, 8 steps):
+        1. Validate message non-empty else "commit message cannot be empty"
+           (exit 1) and repo exists via _find_repo_root() walk else "not a
+           blobtrack repository"
+        2. Open IndexDB(repo/.blobtrack/index.db) + LocalStore(objects)
+           (Member 4) and list tracked files via IndexDB.list_files() sorted
+           by path posix for deterministic repo-level order (Contract 1,9).
+           If none -> "no tracked files. Run 'blobtrack add' first."
+        3. For each tracked file (e.g., a.txt->[A1,A2] b.txt->[B1,B2,B3]),
+           resolve disk path repo/rel else absolute, stream via Member 2
+           chunk_file_streaming(path) -> ChunkData then
+           process_chunks(stream,batch 16/workers 8) -> ProcessedChunk
+           (hash,compressed). Collect combined_hashes ordered by file path
+           then chunk index (Contract 3) and file_chunk_mappings
+           {file_path,chunk_hash,offset,length,order,uncompressed,compressed}
+        4. Build repo-level Merkle Tree: build_tree(combined_hashes)->
+           MerkleNode (Contract 4, odd level promotes not duplicates, single
+           chunk is root) -> merkle_root = root.hash, tree_data =
+           serialize_tree(root) JSON string (Contract 4)
+        5. Parent handling (Contract 6): latest = get_latest_commit()
+           parent_hash = latest.commit_hash else None. Deserialize parent
+           tree_data via deserialize_tree(json.dumps(dict) if dict else str)
+           for delta. First commit parent None.
+        6. Commit hash (Contract 7): deterministic SHA-256 of
+           f"{merkle_root}:{message}:{timestamp}:{parent or ''}".encode()
+           via hash_bytes() -> commit_hash, timestamp = time.time()
+        7. Delta for logging (Contract 5): if parent_tree exists
+           compute_delta(parent_tree,new_tree) -> {added,removed,unchanged}
+           display "| delta: +N -M =K" (positional prune, by_set reserved
+           for push/pull per Member 3)
+        8. Persist atomically via Member 4 IndexDB.save_commit(
+           commit_hash,message,parent_hash,author=None,timestamp,
+           merkle_root_hash,tree_data,file_chunk_mappings) which inserts
+           commits + chunks (INSERT OR IGNORE) + chunk_refs (offset/length/
+           order, FK CASCADE). Handles JSON tree_data serialization internally.
+           Wraps StorageError -> exit 1, never leaves half commit.
+
+    Contracts Satisfied:
+        - Current state = tracked files ordered posix (Contract 1)
+        - Repo Merkle = concatenation of per-file ordered hashes (Contract 2)
+        - Chunk order = file path sorted + chunk.index (Contract 3)
+        - Merkle API build_tree/root.hash/serialize (Contract 4)
+        - Delta compute_delta (Contract 5)
+        - Parent None/first else latest (Contract 6)
+        - Commit hash deterministic SHA-256 (Contract 7)
+        - save_commit signature exact (Contract 8)
+        - Multi-file snapshot coherent (Contract 9)
+
+    Safety: message/repo/file validation first, no traceback for user
+    errors, handles missing tracked file on disk by skipping with warning,
+    does NOT re-implement CDC/hash/compress/Merkle. Outputs via Rich
+    "Committed <12> - N file(s), M chunks, root <12>... | delta ... - \"msg\""
+    plus dim parent link. Tested: first commit parent None, second same file
+    same root 01a19c parent link, third modified root 348a7d delta +1 -1.
+
+    Args:
+        message: Commit message string from -m/--message (required by argparse)
+    Returns:
+        Exits 0 on success, 1 on validation/storage error. Closes IndexDB.
+    Staged implementation: first commit -> second parent -> delta (3C-3E).
 
 FUNCTION: cmd_log() -> None
     STUB — Increment 4.
