@@ -1,0 +1,100 @@
+================================================================================
+ BLOBTRACK — STORAGE & SYNC DOCUMENTATION
+ Content-Aware Binary Version Control System
+================================================================================
+
+
+================================================================================
+ FILE: local_store.py — Physical Chunk Storage
+================================================================================
+
+MODULE OVERVIEW:
+    Manages the physical storage of compressed chunk objects on the local
+    filesystem inside `.blobtrack/objects/`. It guarantees chunk integrity
+    via atomic file writes and provides methods for adding, retrieving,
+    and garbage collecting chunks.
+
+CLASS: LocalStore
+    Manages the objects directory.
+
+    Attributes:
+        objects_dir: The root objects folder (.blobtrack/objects).
+        tmp_dir:     A hidden temporary folder for atomic writes (.blobtrack/objects/.tmp).
+
+    Optimization: Fan-Out Directory Structure
+        Rather than dumping 100,000+ files into a single flat directory
+        (which causes severe OS file system performance degradation), it uses
+        a Git-style fan-out structure. The first 2 characters of the chunk's
+        SHA-256 hash act as the subdirectory name.
+        Example: A chunk with hash `a3f8b...` is stored at
+        `.blobtrack/objects/a3/a3f8b...`
+
+    FUNCTION: store_chunk(chunk_hash, data) -> bool
+        Stores chunk data using atomic file replacement.
+        1. Writes the data to a temporary file in `.tmp/`.
+        2. Calls `os.fsync()` to guarantee the bytes hit the physical disk.
+        3. Uses `shutil.move()` to atomically move the file into the fan-out
+           directory.
+        This prevents corrupt or half-written chunks if the system crashes.
+
+    FUNCTION: garbage_collect(active_hashes) -> Tuple[int, int]
+        Deletes any chunks in the object store that are NOT in the `active_hashes`
+        set. This prevents the "Infinite Storage Leak" by purging orphaned
+        chunks that are no longer part of any commit history.
+
+
+================================================================================
+ FILE: index_db.py — SQLite Metadata Database
+================================================================================
+
+MODULE OVERVIEW:
+    Manages all repository metadata: tracked files, commit history, chunk
+    sizes, and the mappings between commits, files, and chunks.
+
+    Optimization: WAL Mode and Batching
+        To prevent SQLite disk I/O from bottlenecking the multithreaded
+        hashing engine, the database is initialized with:
+        `PRAGMA journal_mode = WAL;` (Write-Ahead Logging)
+        `PRAGMA synchronous = NORMAL;`
+        Furthermore, large inserts use `executemany()` to batch database writes.
+
+CLASS: IndexDB
+    Wraps the SQLite connection and provides high-level queries.
+
+    TABLES:
+        files:      Tracks file paths and sizes currently in the workspace.
+        commits:    Stores commit hashes, parent hashes, messages, and Merkle roots.
+        chunks:     Stores chunk hashes and uncompressed/compressed sizes.
+        chunk_refs: Maps a commit to the specific chunks that make up each file.
+                    Includes offset and chunk ordering information.
+
+    FUNCTION: get_active_chunk_hashes() -> Set[str]
+        Used by the Garbage Collector. Queries `chunk_refs` to find every
+        chunk currently referenced by ANY commit in the repository history.
+
+
+================================================================================
+ FILE: remote_sync.py — Push and Pull Delta Syncing
+================================================================================
+
+MODULE OVERVIEW:
+    Handles synchronizing delta chunks between a local and remote repository.
+    Uses Member 3's `compute_delta_by_set` to perform highly efficient
+    comparisons, ensuring that ONLY new chunks are ever transmitted over
+    the network (or copied to the backup drive).
+
+CLASS: RemoteSync
+    Contains static methods for `push` and `pull` operations.
+
+    FUNCTION: push(remote_path, local_store, local_db)
+        1. Initializes the remote repository if it doesn't exist.
+        2. Identifies all commits that exist locally but not remotely.
+        3. Collects all chunk hashes required by the new commits.
+        4. Filters out chunks that the remote already possesses (deduplication).
+        5. Copies only the missing chunks to the remote's object store.
+        6. Syncs the SQLite database entries to reflect the new commits.
+
+    FUNCTION: pull(...)
+        The inverse of push. Compares remote commits with local commits,
+        downloads missing chunks from the remote's object store into the
+        local `.blobtrack/objects/` folder, and updates the local SQLite DB.
