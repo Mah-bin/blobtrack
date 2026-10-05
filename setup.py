@@ -13,6 +13,7 @@ setup(
     ],
     entry_points={
         "console_scripts": [
+            "blob=blobtrack.cli.main:main",
             "blobtrack=blobtrack.cli.main:main",
         ],
     },

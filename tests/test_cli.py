@@ -131,7 +131,8 @@ class TestCLIHelp:
             text=True,
         )
         assert result.returncode == 0
-        assert "blobtrack" in result.stdout.lower() or "blobtrack" in result.stderr.lower()
+        from blobtrack import __version__
+        assert f"blob {__version__}" in result.stdout
 
 
 # ---------------------------------------------------------------------------

@@ -1,8 +1,8 @@
-"""blobtrack CLI entry point - argparse front door.
+"""blob CLI entry point - argparse front door.
 
 Member 1 - CLI & Integration Lead
 Phase 1: registers all 8 commands, dispatches to commands.py
-Future commands (add/commit/log/etc) are parsed but stubbed until later increments.
+The primary CLI command is `blob` (with `blobtrack` as a backward-compatible alias).
 """
 
 import argparse
@@ -14,15 +14,15 @@ from blobtrack.cli import commands
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="blobtrack",
+        prog="blob",
         description="Content-Aware Binary Version Control System - incremental versioning for massive binary files",
     )
-    parser.add_argument("--version", action="version", version=f"blobtrack {__version__}")
+    parser.add_argument("--version", action="version", version=f"blob {__version__}")
 
     sub = parser.add_subparsers(dest="cmd", required=True, title="commands", metavar="<command>")
 
     # init - no args
-    sub.add_parser("init", help="Create a new blobtrack repository in the current directory")
+    sub.add_parser("init", help="Create a new blob repository in the current directory")
 
     # add - requires filepath
     p_add = sub.add_parser("add", help="Chunk, hash and stage a file (Increment 2)")

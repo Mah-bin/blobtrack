@@ -10,7 +10,7 @@
 
 MODULE OVERVIEW:
     This is the front door of the entire application. When a user types
-    "blobtrack <command>" in their terminal, this file receives the input,
+    "blob <command>" in their terminal, this file receives the input,
     parses it using Python's argparse library, and routes it to the
     correct handler function in commands.py.
 
@@ -23,12 +23,12 @@ FUNCTION: build_parser() -> argparse.ArgumentParser
     Constructs the argument parser with all 8 subcommands.
 
     Global Arguments:
-        --version       Prints "blobtrack 0.1.0" and exits.
+        --version       Prints "blob 0.1.0" and exits.
         --help          Prints the help menu listing all commands.
 
     Subcommands Registered:
         init            No arguments required.
-                        Creates a new blobtrack repository.
+                        Creates a new blob repository.
 
         add <filepath>  Requires 1 positional argument: the file path.
                         Chunks, hashes, and stages the file.
@@ -52,7 +52,7 @@ FUNCTION: build_parser() -> argparse.ArgumentParser
                         Deletes orphan chunks with zero references.
 
     Design Decision: "required=True" on subparsers
-        This forces the user to type a command. Running bare "blobtrack"
+        This forces the user to type a command. Running bare "blob"
         with no command will print an error instead of silently doing nothing.
 
     Design Decision: "nargs='?' with default='origin'" on push/pull
@@ -60,7 +60,7 @@ FUNCTION: build_parser() -> argparse.ArgumentParser
         "origin" if no remote name is specified.
 
 FUNCTION: main() -> None
-    The main execution function. Called when the user runs blobtrack.
+    The main execution function. Called when the user runs blob.
 
     Flow:
         1. Calls build_parser() to create the argument parser.
@@ -74,9 +74,13 @@ FUNCTION: main() -> None
              the process exits with code 1.
 
     Entry Point Registration:
-        This function is registered as "blobtrack" in setup.py via:
-            entry_points={"console_scripts": ["blobtrack=blobtrack.cli.main:main"]}
-        This allows the user to type "blobtrack" directly in the terminal
+        This function is registered as "blob" (primary) and "blobtrack"
+        (backward-compatible alias) in setup.py via:
+            entry_points={"console_scripts": [
+                "blob=blobtrack.cli.main:main",
+                "blobtrack=blobtrack.cli.main:main",
+            ]}
+        This allows the user to type "blob" directly in the terminal
         after installing the package with "pip install -e ."
 
 
@@ -108,7 +112,7 @@ HELPER: _print_error(msg: str) -> None
     Falls back to printing to sys.stderr if Rich is unavailable.
 
 FUNCTION: cmd_init(cwd: pathlib.Path | None = None) -> None
-    Creates a new blobtrack repository in the current working directory.
+    Creates a new blob repository in the current working directory.
 
     What it creates:
         .blobtrack/             Hidden root directory (like .git/)

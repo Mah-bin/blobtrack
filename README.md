@@ -1,11 +1,11 @@
 # blobtrack — Content-Aware Binary Version Control System
 
-> A `git`-like CLI for **incremental versioning of massive binary files** (videos, AI datasets, 3D models) using **Content-Defined Chunking, SHA-256, Merkle Trees, and Delta Synchronization**.
+> A `git`-like CLI (`blob`) for **incremental versioning of massive binary files** (videos, AI datasets, 3D models) using **Content-Defined Chunking, SHA-256, Merkle Trees, and Delta Synchronization**.
 
 ![Python](https://img.shields.io/badge/python-3.10+-blue) ![Tests](https://img.shields.io/badge/tests-99_passed-brightgreen) ![Status](https://img.shields.io/badge/phase-5_done-green)
 
 **Problem:** `git` stores a full 20 GB binary copy on every change → 20 commits = 400 GB wasted.
-**Solution:** `blobtrack` slices files into ~2 MB variable chunks, fingerprints each with SHA-256, and stores **only changed chunks**. A 20 GB edit becomes a ~40 MB delta.
+**Solution:** `blob` slices files into ~2 MB variable chunks, fingerprints each with SHA-256, and stores **only changed chunks**. A 20 GB edit becomes a ~40 MB delta.
 
 ---
 
@@ -29,7 +29,7 @@
 
 ## 1. Overview
 
-`blobtrack` enables true incremental versioning of large binaries without wasting storage or bandwidth. The 4-step pipeline:
+`blob` enables true incremental versioning of large binaries without wasting storage or bandwidth. The 4-step pipeline:
 
 ```
 1. CHUNK  → 2. FINGERPRINT → 3. COMPARE → 4. SYNC
@@ -53,7 +53,7 @@ using CDC                                   (deduplicated)
 *   **Streaming:** Never loads whole file into RAM (`chunk_file_streaming` + `process_chunks` batch 16, workers 8)
 *   **Atomic:** `LocalStore` writes via `tempfile + fsync + atomic move`, `IndexDB` WAL mode with `IF NOT EXISTS`
 *   **Remote sync:** `push` transfers only missing chunks + commits, `pull` fetches delta, zero-transfer on re-sync
-*   **8 CLI commands:** `init, add, commit, log, checkout, gc, push, pull` (all 8 fully implemented)
+*   **8 CLI commands:** `blob init, add, commit, log, checkout, gc, push, pull` (all 8 fully implemented)
 
 ## 3. Installation
 
@@ -73,39 +73,39 @@ py -m venv venv
 py -m pip install -r requirements.txt
 # fastcdc, zstandard, rich, pytest
 
-# Editable install (registers `blobtrack` command)
+# Editable install (registers `blob` command)
 py -m pip install -e .
 
 # Verify
-blobtrack --help
+blob --help
 ```
 
-> If `blobtrack` not found: `$env:Path += ";C:\Users\Admin\AppData\Local\Programs\Python\Python314\Scripts"` (Windows)
+> If `blob` not found: `$env:Path += ";C:\Users\Admin\AppData\Local\Programs\Python\Python314\Scripts"` (Windows)
 
 ## 4. Quick Start
 
 ```bash
 mkdir demo && cd demo
-blobtrack init
+blob init
 # Initialized empty blobtrack repository in ...\.blobtrack
 
 # Create a file, add and commit
 py -c "open('video.mp4','wb').write(b'A'*5242880 + b'B'*5242880)" # 10 MB
-blobtrack add video.mp4
+blob add video.mp4
 # Added 'video.mp4' -> 2 chunks (2 new, 0 reused, 0.0% dedup) [10485760 -> 357 bytes compressed]
 
-blobtrack commit -m "first version"
+blob commit -m "first version"
 # Committed ca6543a654c6 - 1 file(s), 2 chunks, root a57493c037eb... - "first version"
 
 # Modify 1KB, re-add and commit
 py -c "f=open('video.mp4','r+b'); f.seek(2097152); f.write(b'X'*1024); f.close()"
-blobtrack add video.mp4
+blob add video.mp4
 # Added 'video.mp4' -> 2 chunks (1 new, 1 reused, 50.0% dedup)
-blobtrack commit -m "second version"
+blob commit -m "second version"
 # Committed 01de1f33cb00 - 1 file(s), 2 chunks, root 54e9f75c1140... | delta: +1 -1 =1
 
 # History and checkout
-blobtrack log
+blob log
 # +------------------+----------------+--------+---------------------+--------------+
 # | Hash             | Message        | Author | Date                | Parent       |
 # |------------------+----------------+--------+---------------------+--------------|
@@ -113,22 +113,22 @@ blobtrack log
 # | ca6543a654c6     | first version  | -      | 2026-08-27 12:34:29 | -            |
 # +------------------+----------------+--------+---------------------+--------------+
 
-blobtrack checkout ca6543a654c6
+blob checkout ca6543a654c6
 # Checked out ca6543a654c6 - restored 1 file(s), 2 chunks, 10485760 bytes
 
-blobtrack gc
+blob gc
 # Garbage collection: no orphan chunks found - all 0 orphans, 0 bytes freed
 
 # Push to a remote location
-blobtrack push D:\backup\demo_remote
+blob push D:\backup\demo_remote
 # Push complete: Commits synced 2, Chunks transferred 3, Skipped 0
 
 # Pull into a different repo
 cd C:\other\clone
-blobtrack init
-blobtrack pull D:\backup\demo_remote
+blob init
+blob pull D:\backup\demo_remote
 # Pull complete: Commits synced 2, Chunks transferred 3
-blobtrack checkout ca6543a654c6
+blob checkout ca6543a654c6
 # Checked out ca6543a654c6 - restored 1 file(s), exact SHA-256 match
 ```
 
@@ -138,26 +138,26 @@ blobtrack checkout ca6543a654c6
 
 | Command | Description | Example | Status |
 |---|---|---|---|
-| `blobtrack --help` | Show all 8 commands | `blobtrack --help` | ✅ |
-| `blobtrack --version` | Show version `0.1.0` | `blobtrack --version` | ✅ |
-| `blobtrack init` | Create repo in current dir | `blobtrack init` | ✅ Phase 1 |
-| `blobtrack add <file>` | Chunk, compress, deduplicate, store | `blobtrack add video.mp4` | ✅ Phase 2 |
-| `blobtrack commit -m "msg"` | Snapshot current state with Merkle root + parent | `blobtrack commit -m "v1"` | ✅ Phase 3 |
-| `blobtrack log` | Show commit history newest first | `blobtrack log` | ✅ Phase 4 |
-| `blobtrack checkout <hash>` | Reconstruct files from commit (exact SHA-256 verified) | `blobtrack checkout ca6543a6` | ✅ Phase 4 |
-| `blobtrack gc` | Delete orphan chunks not in any commit | `blobtrack gc` | ✅ Phase 4 |
-| `blobtrack push <remote>` | Push delta chunks + commits to remote | `blobtrack push D:\backup` | ✅ Phase 5 |
-| `blobtrack pull <remote>` | Pull delta chunks + commits from remote | `blobtrack pull D:\backup` | ✅ Phase 5 |
+| `blob --help` | Show all 8 commands | `blob --help` | ✅ |
+| `blob --version` | Show version `0.1.0` | `blob --version` | ✅ |
+| `blob init` | Create repo in current dir | `blob init` | ✅ Phase 1 |
+| `blob add <file>` | Chunk, compress, deduplicate, store | `blob add video.mp4` | ✅ Phase 2 |
+| `blob commit -m "msg"` | Snapshot current state with Merkle root + parent | `blob commit -m "v1"` | ✅ Phase 3 |
+| `blob log` | Show commit history newest first | `blob log` | ✅ Phase 4 |
+| `blob checkout <hash>` | Reconstruct files from commit (exact SHA-256 verified) | `blob checkout ca6543a6` | ✅ Phase 4 |
+| `blob gc` | Delete orphan chunks not in any commit | `blob gc` | ✅ Phase 4 |
+| `blob push <remote>` | Push delta chunks + commits to remote | `blob push D:\backup` | ✅ Phase 5 |
+| `blob pull <remote>` | Pull delta chunks + commits from remote | `blob pull D:\backup` | ✅ Phase 5 |
 
-**`blobtrack init`:** Creates `.blobtrack/objects/`, `.blobtrack/commits/`, `.blobtrack/index.db` (WAL SQLite, `0o700`). Idempotent — second run: `Error: repository already initialized` (no delete).
+**`blob init`:** Creates `.blobtrack/objects/`, `.blobtrack/commits/`, `.blobtrack/index.db` (WAL SQLite, `0o700`). Idempotent — second run: `Error: repository already initialized` (no delete).
 
-**`blobtrack add <file>`:**
+**`blob add <file>`:**
 *   Validates repo exists (walk up parents hunting `.blobtrack/`) and file exists/is_file
 *   Streams via `chunk_file_streaming` → `process_chunks` → `has_chunk`/`store_chunk`/`record_chunk` → `register_file`
 *   Output: `Added 'rel/path' -> N chunks (new, reused, dedup% [uncompressed -> compressed])`
 *   Handles relative/absolute paths with spaces, empty files, missing files, directories — all controlled `Error:` + `exit 1`
 
-**`blobtrack commit -m "msg"`:**
+**`blob commit -m "msg"`:**
 *   Validates `message` non-empty and repo + tracked files exist (`list_files()` sorted posix)
 *   Re-chunks each tracked file via `chunk_file_streaming -> process_chunks`, collects `combined_hashes` ordered by file path + chunk index
 *   `build_tree(combined)` -> `root.hash` + `serialize_tree(root)` -> `merkle_root` + `tree_data`
@@ -166,50 +166,50 @@ blobtrack checkout ca6543a654c6
 *   Delta: `compute_delta(parent_tree,new_tree)` -> `| delta: +1 -1 =1` for logging
 *   Persists atomically via `IndexDB.save_commit(...,tree_data,file_chunk_mappings)` with `offset/length/order`
 
-**`blobtrack log`:**
+**`blob log`:**
 *   `IndexDB.list_commits()` `ORDER BY timestamp DESC` newest first
 *   Rich table `Hash[:12] | Message | Author | Date | Parent[:12]` or plain fallback
 *   Read-only, handles `No commits yet`
 
-**`blobtrack checkout <hash>`:**
+**`blob checkout <hash>`:**
 *   Validates `^[0-9a-f]{6,64}$`, resolves short prefix via `list_commits()` prefix search, `get_commit` exists else `commit not found`
 *   `get_commit_chunk_refs(hash)` grouped `file_path` sorted `chunk_order`, for each `LocalStore.retrieve_chunk` -> `packer.decompress` -> `tmpfile + atomic replace` via `Path.replace()` **Policy A** leaves untracked `c.txt` alone
 *   Verifies `len(decompressed)==chunk_length` and `expected_total vs actual`, handles `missing chunk -> Error required chunk ... missing` `1`
 *   Output: `Checked out <12> - restored N file(s), M chunks, total_bytes` + `Commit: "msg" parent -`
 
-**`blobtrack gc`:**
+**`blob gc`:**
 *   `get_active_chunk_hashes()` (all `chunk_refs`) vs `list_chunks()` stored
 *   `get_orphan_chunks()` LEFT JOIN, `LocalStore.garbage_collect(active)` + `delete_chunk_records(orphans)` idempotent
 *   Reports `deleted N orphan(s) from objects, M DB record(s), freed X bytes. Active: N`
 
 **Deduplication & Versioning Examples:**
 ```bash
-blobtrack add test.bin        # 240 KB (<512KB) -> 1 chunks (1 new)
-blobtrack add test.bin        # same file -> 0 new 1 reused 100% (objects stay 1)
-blobtrack commit -m "v1"      # first commit parent None root 01a19c
-blobtrack commit -m "v2"      # same content -> same root 01a19c parent v1, delta +0
+blob add test.bin        # 240 KB (<512KB) -> 1 chunks (1 new)
+blob add test.bin        # same file -> 0 new 1 reused 100% (objects stay 1)
+blob commit -m "v1"      # first commit parent None root 01a19c
+blob commit -m "v2"      # same content -> same root 01a19c parent v1, delta +0
 # 10 MB 2-chunk file, patch 1KB at 2MB, add + commit -> 1 new 1 reused 50% delta +1 -1
-blobtrack checkout v1         # restores exact original SHA-256
-blobtrack gc                  # deletes only deadbeef orphan, preserves active
+blob checkout v1         # restores exact original SHA-256
+blob gc                  # deletes only deadbeef orphan, preserves active
 
 # Remote sync (Phase 5)
-blobtrack push D:\backup\remote  # transfers only new chunks, auto-inits remote
-blobtrack push D:\backup\remote  # second push: "Everything up-to-date" (zero-transfer)
+blob push D:\backup\remote  # transfers only new chunks, auto-inits remote
+blob push D:\backup\remote  # second push: "Everything up-to-date" (zero-transfer)
 # Clone: init → pull → checkout → exact SHA-256 match
 ```
 
-**`blobtrack push <remote>`:**
+**`blob push <remote>`:**
 *   Validates local repo, resolves remote path (relative or absolute), auto-creates remote `.blobtrack/` via `init_remote()`
 *   Delegates to `RemoteSync.push(remote, local_store, local_db)` — delta detection via `has_chunk()`, transfers only missing chunks
 *   Syncs commits oldest-to-newest, skips already-synced commits
 *   Reports: `Commits synced N, Chunks transferred M, Skipped K, Bytes, Throughput`
 *   Zero-transfer on repeat: `"Everything up-to-date"`
 
-**`blobtrack pull <remote>`:**
+**`blob pull <remote>`:**
 *   Validates local repo + remote `.blobtrack/objects/` exists, else controlled error with hint
 *   Delegates to `RemoteSync.pull(remote, local_store, local_db)` — fetches only missing chunks
 *   Does NOT modify working tree — user must `checkout` after pull
-*   Reports same stats table + hint: `"Use 'blobtrack checkout <hash>' to restore a version"`
+*   Reports same stats table + hint: `"Use 'blob checkout <hash>' to restore a version"`
 
 > `push`/`pull` default to `"origin"` if no remote given. "origin" is a literal path, not a stored alias.
 
@@ -218,10 +218,10 @@ blobtrack push D:\backup\remote  # second push: "Everything up-to-date" (zero-tr
 ```
                          USER
                            |
-                    blobtrack command
+                       blob command
                            |
                     ┌──────────────┐
-                    │  cli/main.py │  build_parser() -> 8 subcommands, main() dispatch
+                     │  cli/main.py │  build_parser() -> 8 subcommands, main() dispatch (blob/blobtrack)
                     └──────┬───────┘
                            |
                     ┌──────────────┐
@@ -291,9 +291,9 @@ Incremental, each phase produces a working demo. Current branch: `cli/P5` at Pha
 
 | Phase | What | Who Leads | Deliverable | Status |
 |---|---|---|---|---|
-| **1** | CLI skeleton + `init` + SHA-256 | Member 1+2 | `blobtrack init` works, can hash any file | **DONE** |
-| **2** | CDC chunking + compression + local storage | Member 2+4 | `blobtrack add` slices & stores deduplicated | **DONE** `cli/P2` |
-| **3** | Merkle Tree + delta diffing + `commit` | Member 3+1 | `blobtrack commit` builds tree, detects changes, persists snapshot | **DONE** `cli/P3` |
+| **1** | CLI skeleton + `init` + SHA-256 | Member 1+2 | `blob init` works, can hash any file | **DONE** |
+| **2** | CDC chunking + compression + local storage | Member 2+4 | `blob add` slices & stores deduplicated | **DONE** `cli/P2` |
+| **3** | Merkle Tree + delta diffing + `commit` | Member 3+1 | `blob commit` builds tree, detects changes, persists snapshot | **DONE** `cli/P3` |
 | **4** | History + `checkout` + `gc` | Member 1+4 | `log`/`checkout`/`gc` work - exact reconstruction, orphan GC | **DONE** `cli/P4` |
 | **5** | Remote `push`/`pull` delta sync | Member 1+4 | delta push/pull, dedup, round-trip, 99 tests | **DONE** `cli/P5` |
 
@@ -308,20 +308,20 @@ py -m compileall blobtrack
 
 # Manual Phase 1-5 acceptance (isolated C:\tmp)
 mkdir C:\tmp\verify; cd C:\tmp\verify
-blobtrack init
-blobtrack add test.bin        # 240KB -> 1 chunks (1 new)
-blobtrack commit -m "v1"      # first commit parent None root 01a19c
-blobtrack add test.bin
-blobtrack commit -m "v2"      # second same file same root parent v1
+blob init
+blob add test.bin        # 240KB -> 1 chunks (1 new)
+blob commit -m "v1"      # first commit parent None root 01a19c
+blob add test.bin
+blob commit -m "v2"      # second same file same root parent v1
 # Modify 1KB, add + commit -> delta +1 -1, new root 348a7d
-blobtrack log                 # 2 commits newest first
-blobtrack checkout <v1>       # restores exact original SHA-256
-blobtrack gc                  # no orphans or deletes deadbeef orphan
-blobtrack push D:\backup\repo  # transfers chunks + commits to remote
+blob log                 # 2 commits newest first
+blob checkout <v1>       # restores exact original SHA-256
+blob gc                  # no orphans or deletes deadbeef orphan
+blob push D:\backup\repo  # transfers chunks + commits to remote
 # In a new clone:
-blobtrack init
-blobtrack pull D:\backup\repo  # fetches chunks + commits from remote
-blobtrack checkout <v1>        # restores exact bytes, SHA-256 verified
+blob init
+blob pull D:\backup\repo  # fetches chunks + commits from remote
+blob checkout <v1>        # restores exact bytes, SHA-256 verified
 
 # Specific suites
 py -m pytest tests/test_hasher.py tests/test_chunker.py -v     # Member 2
