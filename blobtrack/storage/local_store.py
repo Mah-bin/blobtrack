@@ -29,8 +29,13 @@ class LocalStore:
         self.tmp_dir.mkdir(parents=True, exist_ok=True)
 
     def get_chunk_path(self, chunk_hash: str) -> Path:
-        """Get the absolute filesystem path for a chunk hash."""
-        return self.objects_dir / chunk_hash
+        """
+        Get the absolute filesystem path for a chunk hash.
+        Uses a Git-style fan-out directory structure (first 2 chars of hash)
+        to prevent OS file system choking when storing >50,000 chunks.
+        """
+        prefix = chunk_hash[:2]
+        return self.objects_dir / prefix / chunk_hash
 
     def has_chunk(self, chunk_hash: str) -> bool:
         """
@@ -60,6 +65,7 @@ class LocalStore:
             temp_file.close()
 
             # Atomic replace / move
+            chunk_path.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(temp_file.name, chunk_path)
             return True
         except Exception:
@@ -97,14 +103,18 @@ class LocalStore:
     def list_chunks(self) -> List[str]:
         """
         List all chunk hashes currently present in the object store.
+        Scans through the fan-out subdirectories.
         """
         if not self.objects_dir.is_dir():
             return []
-        return [
-            entry.name
-            for entry in self.objects_dir.iterdir()
-            if entry.is_file() and not entry.name.startswith(".")
-        ]
+        
+        hashes = []
+        for prefix_dir in self.objects_dir.iterdir():
+            if prefix_dir.is_dir() and len(prefix_dir.name) == 2 and not prefix_dir.name.startswith("."):
+                for chunk_file in prefix_dir.iterdir():
+                    if chunk_file.is_file():
+                        hashes.append(chunk_file.name)
+        return hashes
 
     def get_chunk_size(self, chunk_hash: str) -> int:
         """
