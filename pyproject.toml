@@ -23,10 +23,12 @@ classifiers = [
     "Topic :: Software Development :: Version Control",
 ]
 
-# Upper bounds are deliberate. fastcdc in particular is sensitive to the
-# interpreter: wheels exist for CPython 3.10-3.13 only, and newer
-# interpreters fall back to a pure-Python implementation that is roughly an
-# order of magnitude slower. See blobtrack/core/chunker.py.
+# fastcdc has no compiled wheels on PyPI for any version, so its pure-Python
+# implementation is what actually runs everywhere. blobtrack works fine on that
+# path; the `speed` extra below makes chunking fast.
+#
+# Upper bounds are deliberate. These libraries move fast and a major bump is
+# more likely to change behaviour than to be a compatible improvement.
 dependencies = [
     "fastcdc>=1.5.0,<2.0.0",
     "zstandard>=0.21.0,<1.0.0",
@@ -34,6 +36,15 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Content-defined chunking is a sequential rolling hash and only runs fast in
+# compiled code. On the pure-Python path it is ~90% of the time to add a file.
+# This extra JIT-compiles the identical algorithm, so chunk boundaries are
+# byte-for-byte the same. Install with: pip install blobtrack[speed]
+speed = [
+    "numba>=0.60",
+    "numpy>=1.22,<2.6",
+]
+
 dev = [
     "pytest>=7.0.0",
     "ruff>=0.5.0",

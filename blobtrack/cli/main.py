@@ -1,6 +1,6 @@
 """blob CLI entry point - argparse front door.
 
-The primary command is ``blob``; ``blobtrack`` is kept as an alias so existing
+    The primary command is ``blob``; ``blobtrack`` is kept as an alias so existing
 scripts keep working.
 """
 
@@ -9,6 +9,7 @@ import sys
 
 from blobtrack import __version__
 from blobtrack.cli import commands
+from blobtrack.cli.commands import _warn_backend_once
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -19,7 +20,15 @@ def build_parser() -> argparse.ArgumentParser:
             "versioning for massive binary files"
         ),
     )
-    parser.add_argument("--version", action="version", version=f"blob {__version__}")
+    def _version() -> str:
+        # Report the active chunking backend: it is the single biggest factor
+        # in how fast large files can be added, so a user diagnosing slowness
+        # should be able to see it without reading the source.
+        from blobtrack.core.chunker import backend_description
+
+        return f"blob {__version__} (chunking: {backend_description()})"
+
+    parser.add_argument("--version", action="version", version=_version())
 
     sub = parser.add_subparsers(dest="cmd", required=True, title="commands", metavar="<command>")
 
@@ -68,6 +77,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    # Say so once, up front, if chunking will be slow. Commands that never
+    # touch a file should stay silent about it.
+    _warn_backend_once()
+
     parser = build_parser()
     args = parser.parse_args()
 

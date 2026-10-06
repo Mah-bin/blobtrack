@@ -58,6 +58,7 @@ except ImportError:  # pragma: no cover - exercised only without rich
 from blobtrack.core.merkle_tree import deserialize_tree, serialize_tree
 from blobtrack.storage.index_db import (
     DEFAULT_BRANCH,
+    FormatMismatchError,
     IndexDB,
     branch_ref_name,
     short_branch_name,
@@ -121,22 +122,25 @@ def _format_duration(seconds: float) -> str:
 
 
 def _warn_backend_once() -> None:
-    """Warn once per process when content-defined chunking is pure Python.
+    """Warn once per process when content-defined chunking is running slowly.
 
-    fastcdc's compiled accelerator is unavailable on some interpreters. The
-    fallback runs roughly an order of magnitude slower, and it dominates the
-    whole pipeline, so silently getting it would make every performance
-    number measured on this machine inexplicable.
+    Chunking is ~90% of the cost of adding a file, because the rolling hash is
+    a sequential recurrence that only runs fast in compiled code. When we are on
+    the pure-Python backend the user should know, because the obvious fix is a
+    one-line install rather than anything they did wrong.
     """
-    from blobtrack.core.chunker import CDC_BACKEND
+    from blobtrack.core.chunker import CDC_BACKEND, backend_description
 
-    if CDC_BACKEND == "native" or getattr(_warn_backend_once, "_warned", False):
+    if CDC_BACKEND != "python" or getattr(_warn_backend_once, "_warned", False):
         return
     _warn_backend_once._warned = True  # type: ignore[attr-defined]
     _print_plain(
-        "warning: fastcdc is running in pure-Python mode; chunking is the "
-        "bottleneck and will be much slower. Using CPython 3.10-3.13 gives "
-        "the compiled accelerator.",
+        "note: content-defined chunking is running in pure Python, which is "
+        "roughly 100x slower and dominates the time to add a file.",
+        style="yellow",
+    )
+    _print_plain(
+        f"      backend: {backend_description()}",
         style="yellow",
     )
 
@@ -166,7 +170,20 @@ def _open_repo_storage(
         from blobtrack.storage.index_db import IndexDB as _IndexDB
         from blobtrack.storage.local_store import LocalStore
 
-        return repo_root, _IndexDB(db_path), LocalStore(objects_dir)
+        db = _IndexDB(db_path)
+
+        # Refuse to operate on a repository whose chunking format differs from
+        # this build. Chunk boundaries determine chunk hashes, so writing to a
+        # mismatch would make that history unverifiable and unreconstructable.
+        try:
+            db.verify_format_signature()
+        except FormatMismatchError as exc:
+            db.close()
+            _fail(str(exc))
+
+        return repo_root, db, LocalStore(objects_dir)
+    except SystemExit:
+        raise
     except Exception as exc:
         _fail(f"failed to open repository storage: {exc}")
 
@@ -218,7 +235,15 @@ def cmd_init(cwd: pathlib.Path | None = None) -> None:
         # Build the schema through IndexDB so init and normal use agree.
         from blobtrack.storage.index_db import IndexDB
 
+        # Do this before importing anything that pulls in fastcdc, so a user
+        # without the `speed` extra does not see the library's own banner on a
+        # command that never chunks anything.
+        _warn_backend_once()
+
         db = IndexDB(blobtrack_dir / "index.db")
+        # Stamp the chunking format. Every later command checks this, so a
+        # build with different chunk sizes cannot silently corrupt this repo.
+        db.record_format_signature()
         db.close()
 
     except FileExistsError:
@@ -397,11 +422,53 @@ def cmd_add(filepath: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _resolve_file_chunks(index_db: IndexDB, disk_path: pathlib.Path) -> list[dict]:
+    """Chunk boundaries for one file, preferring the cache.
+
+    Content-defined chunking is deterministic, so a file whose SHA-256 we have
+    seen before will produce exactly the same boundaries. We therefore hash the
+    file (cheap, C speed) and consult the cache before paying for the rolling
+    hash (expensive, and the dominant cost of a commit).
+
+    Returns a list of ``{hash, offset, length}`` in file order.
+    """
+    from blobtrack.core.chunker import chunk_file_streaming
+    from blobtrack.core.hasher import hash_bytes, hash_file_streaming
+
+    file_size = disk_path.stat().st_size
+
+    # A file that fits in a single chunk needs no CDC at all; hashing it is
+    # the whole job.
+    from blobtrack.core.chunker import MIN_CHUNK_SIZE
+
+    if file_size <= MIN_CHUNK_SIZE:
+        with open(disk_path, "rb") as handle:
+            return [
+                {
+                    "hash": hash_bytes(handle.read()),
+                    "offset": 0,
+                    "length": file_size,
+                }
+            ]
+
+    file_hash = hash_file_streaming(str(disk_path))
+    cached = index_db.get_cached_chunks(file_hash)
+    if cached is not None:
+        return cached
+
+    chunks = [
+        {"hash": hash_bytes(c.data), "offset": c.offset, "length": c.length}
+        for c in chunk_file_streaming(str(disk_path))
+    ]
+    index_db.set_cached_chunks(file_hash, chunks, file_size)
+    return chunks
+
+
 def _build_commit_tree(
     index_db: IndexDB,
     local_store,
     repo_root: pathlib.Path,
-) -> tuple[list[str] | None, list[dict], int, int, int]:
+) -> tuple[list[str] | None, list[dict], int, int, int, int]:
     """Chunk every tracked file and return the commit's data.
 
     Missing tracked files are a hard error. Silently skipping them would let a
@@ -410,17 +477,16 @@ def _build_commit_tree(
 
     Returns:
         (combined_hashes, file_chunk_mappings, files_count, chunks_count,
-         new_chunks_stored)
+         new_chunks_stored, cache_hits)
 
     Raises:
         FileNotFoundError: a tracked file is missing from disk.
     """
-    from blobtrack.core.chunker import chunk_file_streaming
-    from blobtrack.core.hasher import process_chunks
+    from blobtrack.core.packer import compress
 
     tracked = index_db.list_files(status="tracked") or index_db.list_files()
     if not tracked:
-        return None, [], 0, 0, 0
+        return None, [], 0, 0, 0, 0
 
     tracked_sorted = sorted(tracked, key=lambda f: f["path"])
 
@@ -437,15 +503,12 @@ def _build_commit_tree(
             + "\n  Restore them, or run 'blob rm <path>' to stop tracking them."
         )
 
-    def needs_payload(chunk_hash: str) -> bool:
-        """Only chunks we do not already have need compressing."""
-        return not local_store.has_chunk(chunk_hash)
-
     combined_hashes: list[str] = []
     file_chunk_mappings: list[dict] = []
     files_count = 0
     chunks_count = 0
     new_stored = 0
+    cache_hits = 0
 
     total_bytes = 0
     for record in tracked_sorted:
@@ -481,38 +544,49 @@ def _build_commit_tree(
     try:
         for record in tracked_sorted:
             disk_path = repo_root / pathlib.Path(record["path"])
-            stream = chunk_file_streaming(str(disk_path))
 
-            for pchunk in process_chunks(
-                stream, batch_size=16, max_workers=8, needs_payload=needs_payload
-            ):
-                combined_hashes.append(pchunk.hash)
+            order = 0
+            for chunk in _resolve_file_chunks(index_db, disk_path):
+                chunk_hash = chunk["hash"]
+                combined_hashes.append(chunk_hash)
 
-                # Persist anything we did not already have, so the commit we
-                # are about to write is always fully backed by real objects.
-                if pchunk.has_payload:
-                    local_store.store_chunk(pchunk.hash, pchunk.compressed_data)
+                compressed_size = 0
+                if not local_store.has_chunk(chunk_hash):
+                    # Only store what we do not already have. Reading the bytes
+                    # is unavoidable for a chunk we have never seen, but it is
+                    # skipped entirely on every later commit.
+                    with open(disk_path, "rb") as handle:
+                        handle.seek(chunk["offset"])
+                        raw = handle.read(chunk["length"])
+
+                    compressed = compress(raw)
+                    local_store.store_chunk(chunk_hash, compressed)
                     new_stored += 1
+                    compressed_size = len(compressed)
                     index_db.record_chunk(
-                        chunk_hash=pchunk.hash,
-                        size_uncompressed=pchunk.length,
-                        size_compressed=len(pchunk.compressed_data),
+                        chunk_hash=chunk_hash,
+                        size_uncompressed=chunk["length"],
+                        size_compressed=compressed_size,
                     )
+                else:
+                    known = index_db.get_chunk(chunk_hash)
+                    compressed_size = (known or {}).get("size_compressed", 0)
 
                 file_chunk_mappings.append(
                     {
                         "file_path": record["path"],
-                        "chunk_hash": pchunk.hash,
-                        "chunk_offset": pchunk.offset,
-                        "chunk_length": pchunk.length,
-                        "chunk_order": pchunk.index,
-                        "size_uncompressed": pchunk.length,
-                        "size_compressed": len(pchunk.compressed_data),
+                        "chunk_hash": chunk_hash,
+                        "chunk_offset": chunk["offset"],
+                        "chunk_length": chunk["length"],
+                        "chunk_order": order,
+                        "size_uncompressed": chunk["length"],
+                        "size_compressed": compressed_size,
                     }
                 )
 
                 chunks_count += 1
-                processed_bytes += pchunk.length
+                processed_bytes += chunk["length"]
+                order += 1
                 _update_progress_bar(
                     progress,
                     task_id,
@@ -534,7 +608,14 @@ def _build_commit_tree(
             except Exception:
                 pass
 
-    return combined_hashes, file_chunk_mappings, files_count, chunks_count, new_stored
+    return (
+        combined_hashes,
+        file_chunk_mappings,
+        files_count,
+        chunks_count,
+        new_stored,
+        cache_hits,
+    )
 
 
 def cmd_commit(message: str) -> None:
@@ -564,6 +645,7 @@ def cmd_commit(message: str) -> None:
                 files_count,
                 chunks_count,
                 new_stored,
+                _cache_hits,
             ) = _build_commit_tree(index_db, local_store, repo_root)
         except FileNotFoundError as exc:
             _fail(str(exc))

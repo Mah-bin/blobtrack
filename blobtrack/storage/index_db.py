@@ -9,6 +9,7 @@ Schema
 ``refs``           branch names pointing at commits
 ``config``         small key/value settings (currently which branch is checked out)
 ``commit_parents`` full parent list, so merge commits with 2+ parents work
+``repo_meta``      the chunking format this repository was written with
 
 ``parent_hash`` on ``commits`` is kept as the *first* parent for backwards
 compatibility; ``commit_parents`` is authoritative when present.
@@ -29,6 +30,36 @@ from typing import Any
 DEFAULT_BRANCH = "main"
 BRANCH_PREFIX = "refs/heads/"
 HEAD_CONFIG_KEY = "HEAD"
+
+
+def chunker_signature() -> dict[str, Any]:
+    """The chunking parameters that determine a repository's on-disk layout.
+
+    Chunk boundaries are derived from the chunk size limits, so two
+    repositories created with different limits are **not** interchangeable:
+    the same input file yields different chunk hashes, and history written by
+    one cannot be verified against the other. Recording the signature lets us
+    refuse to operate on a mismatched repository instead of corrupting it.
+
+    Kept in a helper so the CLI and the database agree on the values.
+    """
+    from blobtrack.core.chunker import (
+        AVG_CHUNK_SIZE,
+        CHUNKER_ID,
+        MAX_CHUNK_SIZE,
+        MIN_CHUNK_SIZE,
+    )
+
+    return {
+        "chunker_id": CHUNKER_ID,
+        "min_chunk_size": MIN_CHUNK_SIZE,
+        "avg_chunk_size": AVG_CHUNK_SIZE,
+        "max_chunk_size": MAX_CHUNK_SIZE,
+    }
+
+
+class FormatMismatchError(RuntimeError):
+    """Raised when a repository's chunking format differs from this build's."""
 
 
 def init_db(db_path: str | Path) -> IndexDB:
@@ -127,6 +158,19 @@ class IndexDB:
                     ordinal INTEGER NOT NULL,
                     PRIMARY KEY (commit_hash, ordinal),
                     FOREIGN KEY (commit_hash) REFERENCES commits (commit_hash) ON DELETE CASCADE
+                );
+
+                CREATE TABLE IF NOT EXISTS repo_meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS chunk_cache (
+                    file_hash TEXT PRIMARY KEY,
+                    chunk_hashes TEXT NOT NULL,
+                    file_size INTEGER NOT NULL,
+                    chunk_count INTEGER NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_chunk_refs_commit ON chunk_refs(commit_hash);
@@ -716,6 +760,161 @@ class IndexDB:
             {"name": short_branch_name(r["ref_name"]), "commit_hash": r["commit_hash"]}
             for r in self.list_refs(BRANCH_PREFIX)
         ]
+
+    # -------------------------------------------------------------------------
+    # Repository format & chunk cache
+    # -------------------------------------------------------------------------
+
+    def set_meta(self, key: str, value: str) -> None:
+        """Record a repository-level metadata value."""
+        conn = self._get_connection()
+        with conn:
+            conn.execute(
+                """
+                INSERT INTO repo_meta (key, value) VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+                """,
+                (key, value),
+            )
+
+    def get_meta(self, key: str, default: str | None = None) -> str | None:
+        conn = self._get_connection()
+        row = conn.execute(
+            "SELECT value FROM repo_meta WHERE key = ?;", (key,)
+        ).fetchone()
+        return row[0] if row and row[0] is not None else default
+
+    def record_format_signature(self, signature: dict[str, Any] | None = None) -> None:
+        """Stamp the repository with the chunking format it was created with.
+
+        Only ever written if absent, so re-opening an existing repository can
+        never silently re-stamp it with the current build's parameters.
+        """
+        if signature is None:
+            signature = chunker_signature()
+
+        existing = self.get_meta("chunker_id")
+        if existing is not None:
+            return
+
+        self.set_meta("chunker_id", str(signature["chunker_id"]))
+        self.set_meta("min_chunk_size", str(signature["min_chunk_size"]))
+        self.set_meta("avg_chunk_size", str(signature["avg_chunk_size"]))
+        self.set_meta("max_chunk_size", str(signature["max_chunk_size"]))
+        self.set_meta("format_version", "1")
+
+    def verify_format_signature(self) -> None:
+        """Confirm this repository is readable by the current build.
+
+        A repository stores its own parameters. If they differ from ours, the
+        same file would chunk differently and its history could not be verified
+        or reconstructed, so we refuse rather than corrupt it.
+
+        Repositories with no recorded signature (written before this was
+        introduced) are adopted at the current settings, which is correct
+        because those builds always used these values.
+
+        Raises:
+            FormatMismatchError: on a genuine mismatch.
+        """
+        current = chunker_signature()
+
+        recorded_id = self.get_meta("chunker_id")
+        if recorded_id is None:
+            # Pre-guard repository: adopt current settings.
+            self.record_format_signature(current)
+            return
+
+        differences = []
+        if recorded_id != current["chunker_id"]:
+            differences.append(f"chunker '{recorded_id}' vs '{current['chunker_id']}'")
+
+        for key in ("min_chunk_size", "avg_chunk_size", "max_chunk_size"):
+            recorded = self.get_meta(key)
+            if recorded is None:
+                continue
+            if int(recorded) != current[key]:
+                differences.append(
+                    f"{key} {int(recorded)} vs {current[key]}"
+                )
+
+        if differences:
+            raise FormatMismatchError(
+                "repository chunking format does not match this build:\n  "
+                + "\n  ".join(differences)
+                + "\n\nRefusing to operate. Chunk boundaries determine chunk "
+                "hashes, so writing to a repository created with different "
+                "chunk sizes would make its history unverifiable. Use the "
+                "matching blobtrack version, or re-initialise the repository."
+            )
+
+    # Chunk-boundary cache -------------------------------------------------
+    # Content-defined chunking is deterministic: identical bytes always
+    # produce identical chunk boundaries. Keying boundaries on the whole-file
+    # SHA-256 therefore lets us skip the (very expensive) rolling-hash pass
+    # entirely for content we have already chunked.
+
+    def get_cached_chunks(self, file_hash: str) -> list[dict] | None:
+        """Chunk descriptors for a previously seen file, or None.
+
+        Each descriptor is ``{"hash": ..., "offset": ..., "length": ...}``.
+        """
+        conn = self._get_connection()
+        row = conn.execute(
+            "SELECT chunk_hashes FROM chunk_cache WHERE file_hash = ?;",
+            (file_hash,),
+        ).fetchone()
+        if not row or not row[0]:
+            return None
+        try:
+            payload = json.loads(row[0])
+        except Exception:
+            return None
+        if not isinstance(payload, list) or not payload:
+            return None
+        return payload
+
+    def set_cached_chunks(
+        self,
+        file_hash: str,
+        chunks: list[dict],
+        file_size: int,
+    ) -> None:
+        """Cache chunk boundaries for a file's content. Idempotent."""
+        if not chunks:
+            return
+        payload = [
+            {
+                "hash": c["hash"],
+                "offset": c["offset"],
+                "length": c["length"],
+            }
+            for c in chunks
+        ]
+        conn = self._get_connection()
+        with conn:
+            conn.execute(
+                """
+                INSERT INTO chunk_cache
+                    (file_hash, chunk_hashes, file_size, chunk_count, created_at)
+                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(file_hash) DO UPDATE SET
+                    chunk_hashes = excluded.chunk_hashes,
+                    file_size = excluded.file_size,
+                    chunk_count = excluded.chunk_count;
+                """,
+                (file_hash, json.dumps(payload), file_size, len(payload)),
+            )
+
+    def count_cached_chunks(self) -> int:
+        conn = self._get_connection()
+        return int(conn.execute("SELECT COUNT(*) FROM chunk_cache;").fetchone()[0])
+
+    def clear_chunk_cache(self) -> int:
+        """Empty the chunk-boundary cache. Returns rows removed."""
+        conn = self._get_connection()
+        with conn:
+            return conn.execute("DELETE FROM chunk_cache;").rowcount
 
     # -------------------------------------------------------------------------
     # Garbage Collection & Reference Counting

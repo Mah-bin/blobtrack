@@ -58,29 +58,67 @@ Filename, absolute path, size in bytes, and a human-readable size string.
 
 ### Backend detection
 
-`fastcdc` ships a Cython accelerator (`fastcdc_cy`) and silently falls back to
-a pure-Python implementation when it cannot be imported. The fallback is
-roughly an order of magnitude slower and holds the GIL, so it cannot be
-parallelized.
+### Backends
+
+The rolling hash is a sequential prefix recurrence: byte *n*'s hash depends on
+bytes *n−1, n−2, …*. It cannot be vectorized or parallelized — the pure-Python
+loop holds the GIL for its entire duration. The only way to make it fast is to
+run it in compiled code.
 
 ```python
-CDC_BACKEND   # "native" or "python"
-CDC_IS_NATIVE # bool
+CDC_BACKEND      # "numba" | "cython" | "python"
+CDC_IS_NATIVE    # True only for fastcdc's compiled accelerator
+CHUNKER_ID       # "gear-cdc-v1" - identifies the format
+backend_description()  # human-readable, shown by `blob --version`
 ```
 
-The CLI checks this and warns, rather than letting unexplained slowness be
-mistaken for a property of the algorithm.
+Backends are tried in order:
 
-**Measured breakdown, 24 MB file, CPython 3.14 (no wheel available):**
+| Backend | Selected when | Measured |
+|---|---|---|
+| `numba` | `pip install blobtrack[speed]` | ~4.7 s → ~0.28 s on 24 MB (**~17x**) |
+| `cython` | fastcdc's `fastcdc_cy` is importable | fast |
+| `python` | always available | baseline |
+
+**`fastcdc` publishes no compiled wheels on PyPI for any version**, so its
+pure-Python implementation runs by default on every interpreter. Earlier
+versions of this project claimed wheels existed for CPython 3.10–3.13; that was
+wrong, and it is why this section exists.
+
+The `numba` backend is a direct transliteration of the same algorithm, so
+**chunk boundaries are byte-identical**. `tests/test_chunker.py` asserts this
+against fastcdc's reference implementation across many file sizes, including
+the boundaries at `min_size` and `max_size`. Set
+`BLOBTRACK_DISABLE_NUMBA=1` to force the fallback, which CI exercises so the
+unaccelerated path stays tested.
+
+**Measured breakdown, 24 MB file, pure-Python backend:**
 
 | Stage | Time | Share |
 |---|---|---|
-| Chunking | ~5.6 s | ~89% |
-| SHA-256 | ~1.2 s | ~19% |
+| Chunking | ~4.7 s | ~89% |
+| SHA-256 | ~1.0 s | ~19% |
 | zstd | ~0.1 s | ~2% |
 
-Chunking dominates. On CPython 3.10–3.13 the accelerator is available and the
-whole pipeline is dramatically faster.
+Chunking dominates, which is why the whole performance effort went there.
+
+### The small-file fast path
+
+A file no larger than `MIN_CHUNK_SIZE` (512 KB) yields exactly one chunk and
+**never invokes the rolling hash**. This is not an approximation: tracing the
+algorithm, when `size <= min_size` the scan returns `size` immediately, so the
+result is provably identical to running the full CDC. Repos of many small
+files would otherwise pay the full per-byte cost for nothing.
+
+### Why boundaries are cached
+
+CDC is deterministic: identical bytes always produce identical boundaries. So
+boundaries are cached in the `chunk_cache` table, keyed by the whole-file
+SHA-256. `_resolve_file_chunks()` hashes the file first (C speed, ~690 MB/s)
+and only pays for chunking on a cache miss.
+
+This makes repeat work nearly free while leaving the first pass — which is
+inherently O(size) — to the compiled backend.
 
 ---
 
