@@ -1,10 +1,12 @@
 import os
 import tempfile
+
 import pytest
-from blobtrack.core.chunker import chunk_file_streaming, read_chunk_at, get_file_info
+
+from blobtrack.core.chunker import chunk_file_streaming, get_file_info, read_chunk_at
 
 
-def _create_temp_file(size_bytes: int, pattern: bytes = b"\xAB") -> str:
+def _create_temp_file(size_bytes: int, pattern: bytes = b"\xab") -> str:
     with tempfile.NamedTemporaryFile(delete=False, suffix=".bin") as f:
         remaining = size_bytes
         write_block = pattern * min(1024 * 1024, size_bytes)
@@ -16,7 +18,6 @@ def _create_temp_file(size_bytes: int, pattern: bytes = b"\xAB") -> str:
 
 
 class TestChunkFileStreaming:
-
     def test_small_file_single_chunk(self):
         temp_path = _create_temp_file(256 * 1024)
         try:
@@ -61,7 +62,7 @@ class TestChunkFileStreaming:
             chunks_1 = list(chunk_file_streaming(temp_path))
             chunks_2 = list(chunk_file_streaming(temp_path))
             assert len(chunks_1) == len(chunks_2)
-            for c1, c2 in zip(chunks_1, chunks_2):
+            for c1, c2 in zip(chunks_1, chunks_2, strict=True):
                 assert c1.offset == c2.offset
                 assert c1.length == c2.length
                 assert c1.data == c2.data
@@ -86,7 +87,7 @@ class TestChunkFileStreaming:
         try:
             chunks = list(chunk_file_streaming(temp_path))
             for chunk in chunks:
-                assert not hasattr(chunk, 'hash')
+                assert not hasattr(chunk, "hash")
         finally:
             os.unlink(temp_path)
 
@@ -106,7 +107,6 @@ class TestChunkFileStreaming:
 
 
 class TestReadChunkAt:
-
     def test_reads_correct_bytes(self):
         content = os.urandom(3 * 1024 * 1024)
         with tempfile.NamedTemporaryFile(delete=False, suffix=".bin") as f:
@@ -115,13 +115,12 @@ class TestReadChunkAt:
 
         try:
             data = read_chunk_at(temp_path, offset=1024, length=2048)
-            assert data == content[1024:1024 + 2048]
+            assert data == content[1024 : 1024 + 2048]
         finally:
             os.unlink(temp_path)
 
 
 class TestGetFileInfo:
-
     def test_returns_correct_size(self):
         size = 2 * 1024 * 1024
         temp_path = _create_temp_file(size)

@@ -21,22 +21,21 @@ import sys
 import pytest
 
 from blobtrack.cli.commands import (
-    cmd_init,
     cmd_add,
-    cmd_commit,
-    cmd_log,
     cmd_checkout,
+    cmd_commit,
     cmd_gc,
-    cmd_push,
+    cmd_init,
     cmd_pull,
+    cmd_push,
 )
 from blobtrack.storage.index_db import IndexDB
 from blobtrack.storage.local_store import LocalStore
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _setup_repo(base: pathlib.Path) -> pathlib.Path:
     """Create and init a blobtrack repo at base, return the path."""
@@ -52,6 +51,7 @@ def _sha256(data: bytes) -> str:
 # ---------------------------------------------------------------------------
 # PUSH TESTS
 # ---------------------------------------------------------------------------
+
 
 class TestPushIntegration:
     def test_push_first(self, tmp_path, monkeypatch):
@@ -85,12 +85,10 @@ class TestPushIntegration:
         (local / "f.bin").write_bytes(b"repeat " * 3000)
         cmd_add(str(local / "f.bin"))
         cmd_commit("C1")
-
         cmd_push(str(remote))
         # Second push should be zero-transfer
         cmd_push(str(remote))
 
-        remote_store = LocalStore(remote / ".blobtrack" / "objects")
         remote_db = IndexDB(remote / ".blobtrack" / "index.db")
         assert len(remote_db.list_commits()) == 1
         remote_db.close()
@@ -105,9 +103,6 @@ class TestPushIntegration:
         cmd_add(str(local / "f.bin"))
         cmd_commit("C1")
         cmd_push(str(remote))
-
-        remote_store = LocalStore(remote / ".blobtrack" / "objects")
-        chunks_after_c1 = len(remote_store.list_chunks())
 
         # Modify and push C2
         (local / "f.bin").write_bytes(b"B" * (2 * 1024 * 1024))
@@ -157,7 +152,7 @@ class TestPushIntegration:
         for i in range(3):
             (local / "f.bin").write_bytes(f"version {i} ".encode() * 3000)
             cmd_add(str(local / "f.bin"))
-            cmd_commit(f"C{i+1}")
+            cmd_commit(f"C{i + 1}")
 
         cmd_push(str(remote))
 
@@ -204,6 +199,7 @@ class TestPushIntegration:
 # ---------------------------------------------------------------------------
 # PULL TESTS
 # ---------------------------------------------------------------------------
+
 
 class TestPullIntegration:
     def test_pull_into_existing_repo(self, tmp_path, monkeypatch):
@@ -308,6 +304,7 @@ class TestPullIntegration:
 # ROUND-TRIP TESTS
 # ---------------------------------------------------------------------------
 
+
 class TestRemoteRoundTrip:
     def test_push_pull_checkout_exact(self, tmp_path, monkeypatch):
         """A->push->remote->pull->B, then B checkout matches A's exact data."""
@@ -402,6 +399,7 @@ class TestRemoteRoundTrip:
 # DELTA DEDUPLICATION TESTS
 # ---------------------------------------------------------------------------
 
+
 class TestRemoteDeduplication:
     def test_first_transfer_all_new(self, tmp_path, monkeypatch):
         """First push has zero skipped chunks."""
@@ -435,8 +433,10 @@ class TestRemoteDeduplication:
         cmd_commit("C1")
         cmd_push(str(remote))
 
-        # Modify and commit
-        (local / "f.bin").write_bytes(b"Y" * 3_000_000)
+        # Modify only the tail, so most chunks survive and only a few are new.
+        # CDC means a localized edit reshuffles at most the boundary chunks.
+        original = (local / "f.bin").read_bytes()
+        (local / "f.bin").write_bytes(original[:-400_000] + b"Z" * 400_000)
         cmd_add(str(local / "f.bin"))
         cmd_commit("C2")
 
@@ -448,8 +448,14 @@ class TestRemoteDeduplication:
         stats = RemoteSync.push(remote, ls, db)
         db.close()
 
-        # Should skip the chunks from C1 that are already on remote
-        assert stats["skipped_chunks"] >= 1
+        # The Merkle delta drives the transfer, so a localized edit must move
+        # far fewer bytes than the whole file.
+        assert stats["used_merkle_delta"] is True
+        assert stats["commits_synced"] == 1
+        assert stats["transferred_chunks"] >= 1
+        assert stats["transferred_bytes"] < len(original), (
+            "delta push must transfer less than the full file"
+        )
 
     def test_zero_transfer_sync(self, tmp_path, monkeypatch):
         """Push+Push on same state = zero transfer second time."""
@@ -503,6 +509,7 @@ class TestRemoteDeduplication:
 # GC INTERACTION TEST
 # ---------------------------------------------------------------------------
 
+
 class TestGCInteraction:
     def test_gc_then_push_pull(self, tmp_path, monkeypatch):
         """Push, modify, commit, GC local orphans, push again - works."""
@@ -549,6 +556,7 @@ class TestGCInteraction:
 # CLI SUBPROCESS TESTS (actual blobtrack command)
 # ---------------------------------------------------------------------------
 
+
 class TestCLISubprocess:
     def test_push_via_subprocess(self, tmp_path, monkeypatch):
         """Test push via actual CLI invocation."""
@@ -559,22 +567,27 @@ class TestCLISubprocess:
         # Init and commit via subprocess
         subprocess.run(
             [sys.executable, "-m", "blobtrack.cli.main", "init"],
-            cwd=str(local), capture_output=True
+            cwd=str(local),
+            capture_output=True,
         )
         (local / "test.bin").write_bytes(b"subprocess push test " * 2000)
         subprocess.run(
             [sys.executable, "-m", "blobtrack.cli.main", "add", "test.bin"],
-            cwd=str(local), capture_output=True
+            cwd=str(local),
+            capture_output=True,
         )
         subprocess.run(
             [sys.executable, "-m", "blobtrack.cli.main", "commit", "-m", "sub C1"],
-            cwd=str(local), capture_output=True
+            cwd=str(local),
+            capture_output=True,
         )
 
         # Push via subprocess
         result = subprocess.run(
             [sys.executable, "-m", "blobtrack.cli.main", "push", str(remote)],
-            cwd=str(local), capture_output=True, text=True
+            cwd=str(local),
+            capture_output=True,
+            text=True,
         )
         assert result.returncode == 0
         assert "Pushed to" in result.stdout or "Push" in result.stdout
@@ -590,30 +603,37 @@ class TestCLISubprocess:
         # Source: init, add, commit, push
         subprocess.run(
             [sys.executable, "-m", "blobtrack.cli.main", "init"],
-            cwd=str(source), capture_output=True
+            cwd=str(source),
+            capture_output=True,
         )
         (source / "data.bin").write_bytes(b"subprocess pull test " * 2000)
         subprocess.run(
             [sys.executable, "-m", "blobtrack.cli.main", "add", "data.bin"],
-            cwd=str(source), capture_output=True
+            cwd=str(source),
+            capture_output=True,
         )
         subprocess.run(
             [sys.executable, "-m", "blobtrack.cli.main", "commit", "-m", "src C1"],
-            cwd=str(source), capture_output=True
+            cwd=str(source),
+            capture_output=True,
         )
         subprocess.run(
             [sys.executable, "-m", "blobtrack.cli.main", "push", str(remote)],
-            cwd=str(source), capture_output=True
+            cwd=str(source),
+            capture_output=True,
         )
 
         # Clone: init, pull
         subprocess.run(
             [sys.executable, "-m", "blobtrack.cli.main", "init"],
-            cwd=str(clone), capture_output=True
+            cwd=str(clone),
+            capture_output=True,
         )
         result = subprocess.run(
             [sys.executable, "-m", "blobtrack.cli.main", "pull", str(remote)],
-            cwd=str(clone), capture_output=True, text=True
+            cwd=str(clone),
+            capture_output=True,
+            text=True,
         )
         assert result.returncode == 0
         assert "Pulled from" in result.stdout or "Pull" in result.stdout
@@ -622,7 +642,9 @@ class TestCLISubprocess:
         """Push outside repo returns exit code 1."""
         result = subprocess.run(
             [sys.executable, "-m", "blobtrack.cli.main", "push", str(tmp_path / "remote")],
-            cwd=str(tmp_path), capture_output=True, text=True
+            cwd=str(tmp_path),
+            capture_output=True,
+            text=True,
         )
         assert result.returncode == 1
 
@@ -632,10 +654,13 @@ class TestCLISubprocess:
         local.mkdir()
         subprocess.run(
             [sys.executable, "-m", "blobtrack.cli.main", "init"],
-            cwd=str(local), capture_output=True
+            cwd=str(local),
+            capture_output=True,
         )
         result = subprocess.run(
             [sys.executable, "-m", "blobtrack.cli.main", "pull", str(tmp_path / "nope")],
-            cwd=str(local), capture_output=True, text=True
+            cwd=str(local),
+            capture_output=True,
+            text=True,
         )
         assert result.returncode == 1

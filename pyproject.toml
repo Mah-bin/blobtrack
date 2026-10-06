@@ -1,0 +1,81 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "blobtrack"
+version = "0.2.0"
+description = "Content-Aware Binary Version Control System"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+keywords = ["version-control", "deduplication", "content-defined-chunking", "merkle-tree", "binary"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Version Control",
+]
+
+# Upper bounds are deliberate. fastcdc in particular is sensitive to the
+# interpreter: wheels exist for CPython 3.10-3.13 only, and newer
+# interpreters fall back to a pure-Python implementation that is roughly an
+# order of magnitude slower. See blobtrack/core/chunker.py.
+dependencies = [
+    "fastcdc>=1.5.0,<2.0.0",
+    "zstandard>=0.21.0,<1.0.0",
+    "rich>=13.0.0,<15.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "ruff>=0.5.0",
+]
+
+[project.scripts]
+blob = "blobtrack.cli.main:main"
+blobtrack = "blobtrack.cli.main:main"
+
+[tool.setuptools.packages.find]
+# Exclude tests so they are never installed as a top-level `tests` package,
+# which would shadow any other project using that name on the same path.
+include = ["blobtrack*"]
+exclude = ["tests*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+filterwarnings = ["error::DeprecationWarning:blobtrack.*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+exclude = [".blobtrack", "build", "dist", ".venv"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # isort
+    "UP",   # pyupgrade
+    "B",    # bugbear
+]
+ignore = [
+    "E501",    # line length is handled by the formatter
+    "B008",    # function call in default arg (argparse pattern)
+    "UP031",   # prefer explicit % formatting is not enforced here
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E402"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["blobtrack"]

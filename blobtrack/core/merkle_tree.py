@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 
 class MerkleNode:
@@ -31,8 +31,8 @@ class MerkleNode:
     def __init__(
         self,
         hash_val: str,
-        left: Optional["MerkleNode"] = None,
-        right: Optional["MerkleNode"] = None,
+        left: MerkleNode | None = None,
+        right: MerkleNode | None = None,
         is_leaf: bool = False,
     ):
         self.hash = hash_val
@@ -56,7 +56,7 @@ def _combine_hashes(left_hash: str, right_hash: str) -> str:
     return hashlib.sha256(combined).hexdigest()
 
 
-def build_tree(chunk_hashes: List[str]) -> Optional[MerkleNode]:
+def build_tree(chunk_hashes: list[str]) -> MerkleNode | None:
     """Build a Merkle Tree bottom-up from an ordered list of chunk fingerprints.
 
     Args:
@@ -78,7 +78,7 @@ def build_tree(chunk_hashes: List[str]) -> Optional[MerkleNode]:
         return None
 
     # Level 0: leaves, one per chunk, in file order.
-    level: List[MerkleNode] = [MerkleNode(hash_val=h, is_leaf=True) for h in chunk_hashes]
+    level: list[MerkleNode] = [MerkleNode(hash_val=h, is_leaf=True) for h in chunk_hashes]
 
     # A single-chunk file is its own root.
     if len(level) == 1:
@@ -86,7 +86,7 @@ def build_tree(chunk_hashes: List[str]) -> Optional[MerkleNode]:
 
     # Repeatedly pair nodes until only the root remains.
     while len(level) > 1:
-        next_level: List[MerkleNode] = []
+        next_level: list[MerkleNode] = []
         i = 0
         while i < len(level):
             if i + 1 < len(level):
@@ -103,10 +103,10 @@ def build_tree(chunk_hashes: List[str]) -> Optional[MerkleNode]:
     return level[0]
 
 
-def serialize_tree(root: Optional[MerkleNode]) -> str:
+def serialize_tree(root: MerkleNode | None) -> str:
     """Serialize a Merkle Tree to a JSON string for storage on disk."""
 
-    def _to_dict(node: Optional[MerkleNode]) -> Optional[Dict[str, Any]]:
+    def _to_dict(node: MerkleNode | None) -> dict[str, Any] | None:
         if node is None:
             return None
         return {
@@ -119,10 +119,10 @@ def serialize_tree(root: Optional[MerkleNode]) -> str:
     return json.dumps(_to_dict(root))
 
 
-def deserialize_tree(data: str) -> Optional[MerkleNode]:
+def deserialize_tree(data: str) -> MerkleNode | None:
     """Reconstruct a Merkle Tree from a JSON string produced by serialize_tree()."""
 
-    def _from_dict(d: Optional[Dict[str, Any]]) -> Optional[MerkleNode]:
+    def _from_dict(d: dict[str, Any] | None) -> MerkleNode | None:
         if d is None:
             return None
         return MerkleNode(
@@ -135,7 +135,7 @@ def deserialize_tree(data: str) -> Optional[MerkleNode]:
     return _from_dict(json.loads(data))
 
 
-def collect_leaf_hashes(root: Optional[MerkleNode]) -> List[str]:
+def collect_leaf_hashes(root: MerkleNode | None) -> list[str]:
     """Return every leaf (chunk) hash under this node, left-to-right in order."""
     if root is None:
         return []

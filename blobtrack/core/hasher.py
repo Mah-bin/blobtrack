@@ -1,7 +1,7 @@
 import hashlib
+from collections.abc import Generator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Generator
 
 from blobtrack.core.packer import compress
 
@@ -16,10 +16,24 @@ class ProcessedChunk:
     hash: str
     compressed_data: bytes
 
+    @property
+    def has_payload(self) -> bool:
+        """True when compressed_data carries real bytes.
+
+        An empty compressed_data is the documented sentinel used by
+        process_chunks(needs_payload=...) to mean "this chunk hashed fine but
+        was deliberately NOT compressed because the caller already has it
+        stored". zstd never produces zero-length output for non-empty input
+        and the chunker never emits empty chunks, so the sentinel is
+        unambiguous.
+        """
+        return bool(self.compressed_data)
+
     def __repr__(self) -> str:
+        payload = f"{len(self.compressed_data)}B" if self.has_payload else "no-payload"
         return (
             f"ProcessedChunk(index={self.index}, offset={self.offset}, "
-            f"length={self.length}, hash={self.hash[:12]}...)"
+            f"length={self.length}, hash={self.hash[:12]}..., {payload})"
         )
 
 
@@ -40,9 +54,15 @@ def hash_file_streaming(filepath: str) -> str:
     return sha256.hexdigest()
 
 
-def _process_single_chunk(chunk_data) -> ProcessedChunk:
+def _process_single_chunk(chunk_data, needs_payload=None) -> ProcessedChunk:
     chunk_hash = hash_bytes(chunk_data.data)
-    compressed = compress(chunk_data.data)
+
+    if needs_payload is None or needs_payload(chunk_hash):
+        compressed = compress(chunk_data.data)
+    else:
+        # Caller already stores this chunk - skip the (expensive) compression
+        # step entirely. Hashing is still performed, it is far cheaper.
+        compressed = b""
 
     return ProcessedChunk(
         index=chunk_data.index,
@@ -57,7 +77,28 @@ def process_chunks(
     chunk_stream: Generator,
     batch_size: int = 16,
     max_workers: int = 8,
+    needs_payload=None,
 ) -> Generator[ProcessedChunk, None, None]:
+    """Hash (and optionally compress) a chunk stream in bounded batches.
+
+    Args:
+        chunk_stream: Iterable of ChunkData objects, e.g. from
+            blobtrack.core.chunker.chunk_file_streaming.
+        batch_size: Chunks buffered before dispatching to the thread pool.
+        max_workers: Thread pool size.
+        needs_payload: Optional callable taking a chunk hash and returning
+            True when the compressed bytes are actually wanted. When it
+            returns False the chunk is still hashed but left uncompressed
+            (ProcessedChunk.has_payload is False).
+
+            `blob add` passes None because it must persist every chunk.
+            `blob commit` passes `lambda h: not store.has_chunk(h)` so that
+            re-committing an unchanged repository costs one SHA-256 pass
+            instead of a full SHA-256 + zstd pass over the whole tree.
+
+    Yields:
+        ProcessedChunk objects strictly in input order.
+    """
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         batch = []
 
@@ -65,12 +106,12 @@ def process_chunks(
             batch.append(chunk)
 
             if len(batch) >= batch_size:
-                futures = [executor.submit(_process_single_chunk, c) for c in batch]
+                futures = [executor.submit(_process_single_chunk, c, needs_payload) for c in batch]
                 for future in futures:
                     yield future.result()
                 batch = []
 
         if batch:
-            futures = [executor.submit(_process_single_chunk, c) for c in batch]
+            futures = [executor.submit(_process_single_chunk, c, needs_payload) for c in batch]
             for future in futures:
                 yield future.result()

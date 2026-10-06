@@ -1,6 +1,28 @@
-"""
-Local chunk object store implementation for blobtrack.
-Stores and retrieves chunk blobs in .blobtrack/objects/<chunk_hash>.
+"""Local chunk object store for blobtrack.
+
+Layout on disk
+--------------
+Chunks are named by the SHA-256 of their *uncompressed* bytes and live at::
+
+    .blobtrack/objects/<first 2 hex chars>/<full 64-char hash>
+
+The two-character fan-out keeps any single directory well under the limit
+most filesystems impose on entries per directory, which matters once a repo
+holds tens of thousands of chunks.
+
+Legacy flat layout
+------------------
+Releases before the fan-out change stored chunks directly at
+``.blobtrack/objects/<hash>``. Every read path here transparently falls back
+to that location so older repositories keep working; :meth:`migrate_layout`
+consolidates them into the canonical fan-out. Writes always use the
+canonical layout.
+
+Integrity
+---------
+:meth:`retrieve_chunk` verifies the SHA-256 of the bytes it hands back
+against the hash it was asked for, by default. A chunk whose name is its own
+content hash is only trustworthy if somebody actually checks it.
 """
 
 from __future__ import annotations
@@ -9,52 +31,74 @@ import os
 import shutil
 import tempfile
 from pathlib import Path
-from typing import Iterable, List, Optional, Set, Tuple, Union
+
+from blobtrack.core.integrity import ChunkIntegrityError
 
 
 class LocalStore:
-    """
-    Manages physical storage of compressed chunk objects on the local filesystem.
-    Uses atomic writes to guarantee chunk integrity.
-    """
+    """Stores and retrieves compressed chunk objects on the local filesystem."""
 
-    def __init__(self, objects_dir: Union[str, Path]):
+    def __init__(self, objects_dir: str | Path):
         self.objects_dir = Path(objects_dir)
         self.tmp_dir = self.objects_dir / ".tmp"
         self.init_store()
 
     def init_store(self) -> None:
-        """Create objects and temp directories if they do not exist."""
+        """Create the objects and temp directories if they do not exist."""
         self.objects_dir.mkdir(parents=True, exist_ok=True)
         self.tmp_dir.mkdir(parents=True, exist_ok=True)
 
+    # ------------------------------------------------------------------
+    # Path resolution
+    # ------------------------------------------------------------------
+
     def get_chunk_path(self, chunk_hash: str) -> Path:
+        """Canonical on-disk path for a chunk (two-character fan-out)."""
+        return self.objects_dir / chunk_hash[:2] / chunk_hash
+
+    def get_legacy_chunk_path(self, chunk_hash: str) -> Path:
+        """Pre-fan-out flat path for a chunk."""
+        return self.objects_dir / chunk_hash
+
+    def resolve_chunk_path(self, chunk_hash: str) -> Path | None:
+        """Return the existing path for a chunk, or None.
+
+        Prefers the canonical fan-out location and falls back to the legacy
+        flat location so repositories written by older versions stay usable.
         """
-        Get the absolute filesystem path for a chunk hash.
-        Uses a Git-style fan-out directory structure (first 2 chars of hash)
-        to prevent OS file system choking when storing >50,000 chunks.
-        """
-        prefix = chunk_hash[:2]
-        return self.objects_dir / prefix / chunk_hash
+        canonical = self.get_chunk_path(chunk_hash)
+        if canonical.is_file():
+            return canonical
+        legacy = self.get_legacy_chunk_path(chunk_hash)
+        if legacy.is_file():
+            return legacy
+        return None
+
+    # ------------------------------------------------------------------
+    # Chunk lifecycle
+    # ------------------------------------------------------------------
 
     def has_chunk(self, chunk_hash: str) -> bool:
-        """
-        Check if a chunk is already stored locally (O(1) deduplication check).
-        """
-        chunk_path = self.get_chunk_path(chunk_hash)
-        return chunk_path.is_file()
+        """O(1)-ish deduplication check. True if the chunk exists in either layout."""
+        return self.resolve_chunk_path(chunk_hash) is not None
 
     def store_chunk(self, chunk_hash: str, data: bytes) -> bool:
-        """
-        Store chunk data under .blobtrack/objects/<chunk_hash>.
-        Uses atomic file replacement to prevent corrupt or partial writes.
-        Returns True if chunk was newly written, False if already existed.
-        """
-        chunk_path = self.get_chunk_path(chunk_hash)
-        if chunk_path.is_file():
-            return False  # Already stored (deduplicated)
+        """Persist a chunk atomically.
 
-        # Write to temporary file in same filesystem, then atomic replace
+        Returns:
+            True if this call wrote new bytes, False if the chunk was already
+            present (deduplicated) in either the canonical or legacy layout.
+
+        Writes go to a temp file in ``objects/.tmp``, are fsync'd, then moved
+        into place with a single rename so a crash can never leave a
+        half-written chunk visible to a reader.
+        """
+        if self.has_chunk(chunk_hash):
+            return False
+
+        chunk_path = self.get_chunk_path(chunk_hash)
+        chunk_path.parent.mkdir(parents=True, exist_ok=True)
+
         temp_file = tempfile.NamedTemporaryFile(
             dir=self.tmp_dir, delete=False, prefix="chunk_", suffix=".tmp"
         )
@@ -64,8 +108,6 @@ class LocalStore:
             os.fsync(temp_file.fileno())
             temp_file.close()
 
-            # Atomic replace / move
-            chunk_path.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(temp_file.name, chunk_path)
             return True
         except Exception:
@@ -76,73 +118,159 @@ class LocalStore:
                     pass
             raise
 
-    def retrieve_chunk(self, chunk_hash: str) -> bytes:
+    def retrieve_chunk(self, chunk_hash: str, verify: bool = False) -> bytes:
+        """Read a chunk's stored (compressed) bytes.
+
+        Args:
+            chunk_hash: Hash the chunk is named by.
+            verify: When True, the payload is decompressed and checked against
+                ``chunk_hash`` before being returned.
+
+                Note this is off by default because the check requires
+                decompressing the chunk, which is far more expensive than the
+                read itself. Callers that are about to hand bytes to a user
+                (``checkout``) or across a trust boundary (``push``/``pull``)
+                should enable it.
+
+        Raises:
+            FileNotFoundError: chunk is absent in both layouts.
+            ChunkIntegrityError: ``verify`` is True and the payload is corrupt.
         """
-        Read raw chunk bytes from storage.
-        Raises FileNotFoundError if chunk does not exist.
-        """
-        chunk_path = self.get_chunk_path(chunk_hash)
-        if not chunk_path.is_file():
-            raise FileNotFoundError(f"Chunk '{chunk_hash}' not found in local store at {chunk_path}")
-        return chunk_path.read_bytes()
+        chunk_path = self.resolve_chunk_path(chunk_hash)
+        if chunk_path is None:
+            raise FileNotFoundError(
+                f"Chunk '{chunk_hash}' not found in local store at "
+                f"{self.get_chunk_path(chunk_hash)}"
+            )
+
+        data = chunk_path.read_bytes()
+
+        if verify:
+            from blobtrack.core.integrity import verify_chunk_payload
+
+            verify_chunk_payload(data, chunk_hash)
+
+        return data
+
+    def verify_chunk(self, chunk_hash: str) -> bool:
+        """True if the chunk exists and its payload matches ``chunk_hash``."""
+        try:
+            self.retrieve_chunk(chunk_hash, verify=True)
+            return True
+        except (FileNotFoundError, ChunkIntegrityError):
+            return False
 
     def delete_chunk(self, chunk_hash: str) -> bool:
-        """
-        Delete a single chunk from the object store.
-        Returns True if deleted, False if it was not found.
-        """
-        chunk_path = self.get_chunk_path(chunk_hash)
-        if chunk_path.is_file():
-            try:
-                chunk_path.unlink()
-                return True
-            except OSError:
-                return False
-        return False
+        """Delete a chunk from either layout. True if something was removed."""
+        chunk_path = self.resolve_chunk_path(chunk_hash)
+        if chunk_path is None:
+            return False
+        try:
+            chunk_path.unlink()
+            return True
+        except OSError:
+            return False
 
-    def list_chunks(self) -> List[str]:
-        """
-        List all chunk hashes currently present in the object store.
-        Scans through the fan-out subdirectories.
+    def list_chunks(self) -> list[str]:
+        """Every chunk hash currently stored, in either layout.
+
+        Scans the fan-out subdirectories *and* any flat files left behind by
+        older versions, so a partially migrated repo still reports a complete
+        picture rather than silently hiding chunks.
         """
         if not self.objects_dir.is_dir():
             return []
-        
-        hashes = []
-        for prefix_dir in self.objects_dir.iterdir():
-            if prefix_dir.is_dir() and len(prefix_dir.name) == 2 and not prefix_dir.name.startswith("."):
-                for chunk_file in prefix_dir.iterdir():
-                    if chunk_file.is_file():
-                        hashes.append(chunk_file.name)
+
+        hashes: list[str] = []
+
+        for entry in self.objects_dir.iterdir():
+            if entry.name.startswith("."):
+                continue
+            if entry.is_dir():
+                # Fan-out bucket: exactly two hex characters.
+                if len(entry.name) == 2:
+                    hashes.extend(child.name for child in entry.iterdir() if child.is_file())
+            elif entry.is_file():
+                # Legacy flat chunk.
+                hashes.append(entry.name)
+
         return hashes
 
     def get_chunk_size(self, chunk_hash: str) -> int:
-        """
-        Return the on-disk size (in bytes) of the stored chunk.
-        """
-        chunk_path = self.get_chunk_path(chunk_hash)
-        if not chunk_path.is_file():
+        """On-disk size of a stored chunk."""
+        chunk_path = self.resolve_chunk_path(chunk_hash)
+        if chunk_path is None:
             raise FileNotFoundError(f"Chunk '{chunk_hash}' not found.")
         return chunk_path.stat().st_size
 
-    def garbage_collect(self, active_hashes: Set[str]) -> Tuple[int, int]:
-        """
-        Scan all stored chunk files and delete those not present in active_hashes.
-        Returns (deleted_chunks_count, total_freed_bytes).
+    def garbage_collect(self, active_hashes: set[str]) -> tuple[int, int]:
+        """Delete stored chunks not referenced by any commit.
+
+        Returns:
+            (deleted_count, freed_bytes)
         """
         deleted_count = 0
         freed_bytes = 0
 
-        stored_hashes = self.list_chunks()
-        for chk_hash in stored_hashes:
-            if chk_hash not in active_hashes:
-                chunk_path = self.get_chunk_path(chk_hash)
-                try:
-                    size = chunk_path.stat().st_size
-                    chunk_path.unlink()
-                    deleted_count += 1
-                    freed_bytes += size
-                except OSError:
-                    continue
+        for chunk_hash in self.list_chunks():
+            if chunk_hash in active_hashes:
+                continue
+            chunk_path = self.resolve_chunk_path(chunk_hash)
+            if chunk_path is None:
+                continue
+            try:
+                size = chunk_path.stat().st_size
+                chunk_path.unlink()
+                deleted_count += 1
+                freed_bytes += size
+            except OSError:
+                continue
 
         return deleted_count, freed_bytes
+
+    # ------------------------------------------------------------------
+    # Maintenance
+    # ------------------------------------------------------------------
+
+    def migrate_layout(self) -> tuple[int, int]:
+        """Move legacy flat chunks into the canonical fan-out layout.
+
+        Safe to run repeatedly and safe to interrupt: chunks are moved with
+        os.replace, so a chunk is never absent from both layouts.
+
+        Returns:
+            (migrated_count, bytes_moved)
+        """
+        if not self.objects_dir.is_dir():
+            return (0, 0)
+
+        migrated = 0
+        moved_bytes = 0
+
+        for entry in list(self.objects_dir.iterdir()):
+            if not entry.is_file() or entry.name.startswith("."):
+                continue
+
+            chunk_hash = entry.name
+            canonical = self.get_chunk_path(chunk_hash)
+            if canonical.is_file():
+                # Already present canonically; the flat copy is redundant.
+                try:
+                    size = entry.stat().st_size
+                    entry.unlink()
+                    migrated += 1
+                    moved_bytes += size
+                except OSError:
+                    pass
+                continue
+
+            try:
+                size = entry.stat().st_size
+                canonical.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(entry, canonical)
+                migrated += 1
+                moved_bytes += size
+            except OSError:
+                continue
+
+        return (migrated, moved_bytes)

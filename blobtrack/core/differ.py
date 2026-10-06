@@ -9,14 +9,10 @@ new, which are gone, and which are unchanged -- so storage/remote_sync.py
 only has to push/pull the handful of chunks that actually changed.
 """
 
-from typing import Dict, List, Optional, Set
-
 from .merkle_tree import MerkleNode, collect_leaf_hashes
 
 
-def compute_delta(
-    old_tree: Optional[MerkleNode], new_tree: Optional[MerkleNode]
-) -> Dict[str, List[str]]:
+def compute_delta(old_tree: MerkleNode | None, new_tree: MerkleNode | None) -> dict[str, list[str]]:
     """Top-down structural diff between two Merkle Trees.
 
     Walks both trees in lockstep, position by position. Whenever the hash at
@@ -39,11 +35,11 @@ def compute_delta(
         For that scenario use compute_delta_by_set() instead, which is exact
         because it compares chunk *content* rather than position.
     """
-    added: List[str] = []
-    removed: List[str] = []
-    unchanged: List[str] = []
+    added: list[str] = []
+    removed: list[str] = []
+    unchanged: list[str] = []
 
-    def _walk(old_node: Optional[MerkleNode], new_node: Optional[MerkleNode]) -> None:
+    def _walk(old_node: MerkleNode | None, new_node: MerkleNode | None) -> None:
         if old_node is None and new_node is None:
             return
 
@@ -77,8 +73,8 @@ def compute_delta(
 
 
 def compute_delta_by_set(
-    old_tree: Optional[MerkleNode], new_tree: Optional[MerkleNode]
-) -> Dict[str, List[str]]:
+    old_tree: MerkleNode | None, new_tree: MerkleNode | None
+) -> dict[str, list[str]]:
     """Content-based (position-independent) diff between two Merkle Trees.
 
     Collects the full set of leaf hashes on each side and compares them with
@@ -93,8 +89,8 @@ def compute_delta_by_set(
     Returns:
         {"added": [...], "removed": [...], "unchanged": [...]}
     """
-    old_hashes: Set[str] = set(collect_leaf_hashes(old_tree))
-    new_hashes: Set[str] = set(collect_leaf_hashes(new_tree))
+    old_hashes: set[str] = set(collect_leaf_hashes(old_tree))
+    new_hashes: set[str] = set(collect_leaf_hashes(new_tree))
 
     return {
         "added": sorted(new_hashes - old_hashes),
