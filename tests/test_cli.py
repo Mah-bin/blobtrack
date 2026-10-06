@@ -13,27 +13,38 @@ Covers:
 - future commands are stubbed (not yet implemented)
 """
 
-import pathlib
 import subprocess
 import sys
 
 import pytest
 
-from blobtrack.cli.main import build_parser
 from blobtrack.cli.commands import cmd_init
-
+from blobtrack.cli.main import build_parser
 
 # ---------------------------------------------------------------------------
 # Parser / help tests
 # ---------------------------------------------------------------------------
 
+
 class TestParser:
     def test_parser_has_all_commands(self):
         parser = build_parser()
-        # Collect subparser choices
-        actions = [a for a in parser._actions if isinstance(a, type(parser._actions[0]))]
-        # Simpler: try parsing each command
-        for cmd in ["init", "add", "commit", "log", "checkout", "push", "pull", "gc"]:
+        for cmd in [
+            "init",
+            "add",
+            "commit",
+            "log",
+            "checkout",
+            "rm",
+            "fsck",
+            "gc",
+            "migrate",
+            "branch",
+            "switch",
+            "merge",
+            "push",
+            "pull",
+        ]:
             # Build minimal valid args for each to ensure parser accepts the command
             if cmd == "add":
                 args = parser.parse_args([cmd, "somefile.bin"])
@@ -46,6 +57,15 @@ class TestParser:
                 assert args.cmd == "checkout"
             elif cmd in ("push", "pull"):
                 args = parser.parse_args([cmd, "origin"])
+                assert args.cmd == cmd
+            elif cmd == "rm":
+                args = parser.parse_args([cmd, "somefile.bin"])
+                assert args.cmd == "rm"
+            elif cmd in ("branch", "switch", "merge"):
+                args = parser.parse_args([cmd, "main"])
+                assert args.cmd == cmd
+            elif cmd in ("gc", "fsck", "migrate"):
+                args = parser.parse_args([cmd])
                 assert args.cmd == cmd
             else:
                 args = parser.parse_args([cmd])
@@ -132,12 +152,14 @@ class TestCLIHelp:
         )
         assert result.returncode == 0
         from blobtrack import __version__
+
         assert f"blob {__version__}" in result.stdout
 
 
 # ---------------------------------------------------------------------------
 # cmd_init tests
 # ---------------------------------------------------------------------------
+
 
 class TestCmdInit:
     def test_init_creates_structure(self, tmp_path):
@@ -187,6 +209,7 @@ class TestCmdInit:
 # Phase 2 - add integration
 # ---------------------------------------------------------------------------
 
+
 class TestAddIntegration:
     def test_add_basic(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
@@ -194,10 +217,12 @@ class TestAddIntegration:
         f = tmp_path / "a.bin"
         f.write_bytes(b"hello add test " * 5000)
         from blobtrack.cli.commands import cmd_add
+
         cmd_add(str(f))
         # Verify objects and DB
         from blobtrack.storage.index_db import IndexDB
         from blobtrack.storage.local_store import LocalStore
+
         assert len(LocalStore(tmp_path / ".blobtrack" / "objects").list_chunks()) >= 1
         db = IndexDB(tmp_path / ".blobtrack" / "index.db")
         assert len(db.list_files()) == 1
@@ -211,6 +236,7 @@ class TestAddIntegration:
         f.write_bytes(b"dedup content " * 8000)
         from blobtrack.cli.commands import cmd_add
         from blobtrack.storage.local_store import LocalStore
+
         cmd_add(str(f))
         c1 = len(LocalStore(tmp_path / ".blobtrack" / "objects").list_chunks())
         cmd_add(str(f))
@@ -221,6 +247,7 @@ class TestAddIntegration:
         monkeypatch.chdir(tmp_path)
         cmd_init(cwd=tmp_path)
         from blobtrack.cli.commands import cmd_add
+
         with pytest.raises(SystemExit) as exc:
             cmd_add(str(tmp_path / "missing.bin"))
         assert exc.value.code == 1
@@ -231,6 +258,7 @@ class TestAddIntegration:
         f = tmp_path / "x.bin"
         f.write_bytes(b"data")
         from blobtrack.cli.commands import cmd_add
+
         with pytest.raises(SystemExit) as exc:
             cmd_add(str(f))
         assert exc.value.code == 1
@@ -240,10 +268,12 @@ class TestAddIntegration:
 # Phase 3 - commit integration
 # ---------------------------------------------------------------------------
 
+
 class TestCommitIntegration:
     def test_commit_without_repo(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
         from blobtrack.cli.commands import cmd_commit
+
         with pytest.raises(SystemExit) as exc:
             cmd_commit("msg")
         assert exc.value.code == 1
@@ -252,6 +282,7 @@ class TestCommitIntegration:
         monkeypatch.chdir(tmp_path)
         cmd_init(cwd=tmp_path)
         from blobtrack.cli.commands import cmd_commit
+
         with pytest.raises(SystemExit) as exc:
             cmd_commit("no files")
         assert exc.value.code == 1
@@ -262,9 +293,11 @@ class TestCommitIntegration:
         f = tmp_path / "file.bin"
         f.write_bytes(b"first version content " * 4000)
         from blobtrack.cli.commands import cmd_add, cmd_commit
+
         cmd_add(str(f))
         cmd_commit("first commit")
         from blobtrack.storage.index_db import IndexDB
+
         db = IndexDB(tmp_path / ".blobtrack" / "index.db")
         commits = db.list_commits()
         assert len(commits) == 1
@@ -280,9 +313,11 @@ class TestCommitIntegration:
         f = tmp_path / "file.bin"
         f.write_bytes(b"content v1 " * 5000)
         from blobtrack.cli.commands import cmd_add, cmd_commit
+
         cmd_add(str(f))
         cmd_commit("v1")
         from blobtrack.storage.index_db import IndexDB
+
         db = IndexDB(tmp_path / ".blobtrack" / "index.db")
         c1 = db.list_commits()[0]["commit_hash"]
         db.close()
@@ -304,9 +339,11 @@ class TestCommitIntegration:
         f = tmp_path / "file.bin"
         f.write_bytes(b"A" * (2 * 1024 * 1024))  # 2MB single chunk
         from blobtrack.cli.commands import cmd_add, cmd_commit
+
         cmd_add(str(f))
         cmd_commit("v1")
         from blobtrack.storage.index_db import IndexDB
+
         db = IndexDB(tmp_path / ".blobtrack" / "index.db")
         r1 = db.list_commits()[0]["merkle_root_hash"]
         db.close()
@@ -323,6 +360,7 @@ class TestCommitIntegration:
         monkeypatch.chdir(tmp_path)
         cmd_init(cwd=tmp_path)
         from blobtrack.cli.commands import cmd_commit
+
         with pytest.raises(SystemExit) as exc:
             cmd_commit("")
         assert exc.value.code == 1
@@ -335,10 +373,12 @@ class TestCommitIntegration:
 # Phase 4 - log / checkout / gc integration
 # ---------------------------------------------------------------------------
 
+
 class TestLogIntegration:
     def test_log_without_repo(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
         from blobtrack.cli.commands import cmd_log
+
         with pytest.raises(SystemExit) as exc:
             cmd_log()
         assert exc.value.code == 1
@@ -347,6 +387,7 @@ class TestLogIntegration:
         monkeypatch.chdir(tmp_path)
         cmd_init(cwd=tmp_path)
         from blobtrack.cli.commands import cmd_log
+
         # Should not exit, just print No commits
         cmd_log()
         captured = capsys.readouterr()
@@ -358,9 +399,11 @@ class TestLogIntegration:
         f = tmp_path / "f.bin"
         f.write_bytes(b"log test " * 2000)
         from blobtrack.cli.commands import cmd_add, cmd_commit, cmd_log
+
         cmd_add(str(f))
         cmd_commit("first log")
         from blobtrack.storage.index_db import IndexDB
+
         db = IndexDB(tmp_path / ".blobtrack" / "index.db")
         assert len(db.list_commits()) == 1
         db.close()
@@ -381,6 +424,7 @@ class TestCheckoutIntegration:
     def test_checkout_requires_repo(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
         from blobtrack.cli.commands import cmd_checkout
+
         with pytest.raises(SystemExit) as exc:
             cmd_checkout("abc123")
         assert exc.value.code == 1
@@ -389,6 +433,7 @@ class TestCheckoutIntegration:
         monkeypatch.chdir(tmp_path)
         cmd_init(cwd=tmp_path)
         from blobtrack.cli.commands import cmd_checkout
+
         with pytest.raises(SystemExit) as exc:
             cmd_checkout("zzzzzz")  # not hex
         assert exc.value.code == 1
@@ -403,11 +448,14 @@ class TestCheckoutIntegration:
         orig = b"checkout exact bytes " * 3000
         f.write_bytes(orig)
         import hashlib
+
         orig_hash = hashlib.sha256(orig).hexdigest()
-        from blobtrack.cli.commands import cmd_add, cmd_commit, cmd_checkout
+        from blobtrack.cli.commands import cmd_add, cmd_checkout, cmd_commit
+
         cmd_add(str(f))
         cmd_commit("v1")
         from blobtrack.storage.index_db import IndexDB
+
         db = IndexDB(tmp_path / ".blobtrack" / "index.db")
         c1 = db.list_commits()[0]["commit_hash"]
         db.close()
@@ -428,11 +476,13 @@ class TestCheckoutIntegration:
         b = tmp_path / "b.txt"
         a.write_bytes(b"A" * 8000)
         b.write_bytes(b"B" * 9000)
-        from blobtrack.cli.commands import cmd_add, cmd_commit, cmd_checkout
+        from blobtrack.cli.commands import cmd_add, cmd_checkout, cmd_commit
+
         cmd_add(str(a))
         cmd_add(str(b))
         cmd_commit("two files")
         from blobtrack.storage.index_db import IndexDB
+
         db = IndexDB(tmp_path / ".blobtrack" / "index.db")
         c1 = db.list_commits()[0]["commit_hash"]
         db.close()
@@ -453,12 +503,14 @@ class TestGCIntegration:
         f = tmp_path / "g.bin"
         f.write_bytes(b"gc test " * 3000)
         from blobtrack.cli.commands import cmd_add, cmd_commit, cmd_gc
+
         cmd_add(str(f))
         cmd_commit("v1")
         # No orphans yet
         cmd_gc()  # should report no orphans, not fail
-        from blobtrack.storage.local_store import LocalStore
         from blobtrack.storage.index_db import IndexDB
+        from blobtrack.storage.local_store import LocalStore
+
         assert len(LocalStore(tmp_path / ".blobtrack" / "objects").list_chunks()) >= 1
         db = IndexDB(tmp_path / ".blobtrack" / "index.db")
         assert len(db.get_orphan_chunks()) == 0
@@ -470,9 +522,11 @@ class TestGCIntegration:
         f = tmp_path / "g2.bin"
         f.write_bytes(b"gc orphan " * 2000)
         from blobtrack.cli.commands import cmd_add, cmd_commit, cmd_gc
+
         cmd_add(str(f))
         cmd_commit("v1")
         from blobtrack.storage.local_store import LocalStore
+
         ls = LocalStore(tmp_path / ".blobtrack" / "objects")
         # Create orphan directly
         ls.store_chunk("deadbeef" * 8, b"orphan")
@@ -483,6 +537,7 @@ class TestGCIntegration:
     def test_gc_requires_repo(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
         from blobtrack.cli.commands import cmd_gc
+
         with pytest.raises(SystemExit) as exc:
             cmd_gc()
         assert exc.value.code == 1
@@ -493,11 +548,13 @@ class TestGCIntegration:
 # Comprehensive tests in test_remote_cli.py
 # ---------------------------------------------------------------------------
 
+
 class TestPushPullImplemented:
     def test_push_requires_repo(self, tmp_path, monkeypatch):
         """Push outside a repo exits 1 with controlled error."""
         monkeypatch.chdir(tmp_path)
         from blobtrack.cli.commands import cmd_push
+
         with pytest.raises(SystemExit) as exc:
             cmd_push(str(tmp_path / "some_remote"))
         assert exc.value.code == 1
@@ -506,7 +563,7 @@ class TestPushPullImplemented:
         """Pull outside a repo exits 1 with controlled error."""
         monkeypatch.chdir(tmp_path)
         from blobtrack.cli.commands import cmd_pull
+
         with pytest.raises(SystemExit) as exc:
             cmd_pull(str(tmp_path / "some_remote"))
         assert exc.value.code == 1
-

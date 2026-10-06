@@ -3,9 +3,9 @@ Unit tests for LocalStore (chunk object store and local garbage collection).
 """
 
 import hashlib
-import os
-import pytest
 from pathlib import Path
+
+import pytest
 
 from blobtrack.storage.local_store import LocalStore
 
@@ -43,8 +43,7 @@ def test_retrieve_missing_chunk(temp_store: LocalStore):
 
 def test_list_and_delete_chunks(temp_store: LocalStore):
     chunks = {
-        hashlib.sha256(f"chunk_{i}".encode()).hexdigest(): f"chunk_{i}".encode()
-        for i in range(5)
+        hashlib.sha256(f"chunk_{i}".encode()).hexdigest(): f"chunk_{i}".encode() for i in range(5)
     }
 
     for h, data in chunks.items():

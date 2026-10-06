@@ -1,13 +1,12 @@
 import os
 import tempfile
-import pytest
+
+from blobtrack.core.chunker import chunk_file_streaming
 from blobtrack.core.hasher import hash_bytes, hash_file_streaming, process_chunks
 from blobtrack.core.packer import decompress
-from blobtrack.core.chunker import chunk_file_streaming
 
 
 class TestHashBytes:
-
     def test_known_hash(self):
         expected = "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
         assert hash_bytes(b"hello world") == expected
@@ -30,7 +29,6 @@ class TestHashBytes:
 
 
 class TestHashFileStreaming:
-
     def test_small_file(self):
         content = b"This is a small test file content."
 
@@ -61,7 +59,6 @@ class TestHashFileStreaming:
 
 
 class TestProcessChunks:
-
     def test_produces_hashes(self):
         content = os.urandom(3 * 1024 * 1024)
         with tempfile.NamedTemporaryFile(delete=False, suffix=".bin") as f:
@@ -104,7 +101,7 @@ class TestProcessChunks:
             processed = list(process_chunks(stream, batch_size=4, max_workers=4))
 
             assert len(raw_chunks) == len(processed)
-            for raw, proc in zip(raw_chunks, processed):
+            for raw, proc in zip(raw_chunks, processed, strict=True):
                 decompressed = decompress(proc.compressed_data)
                 assert decompressed == raw.data
         finally:
@@ -121,7 +118,7 @@ class TestProcessChunks:
             stream = chunk_file_streaming(temp_path)
             processed = list(process_chunks(stream, batch_size=4, max_workers=4))
 
-            for raw, proc in zip(raw_chunks, processed):
+            for raw, proc in zip(raw_chunks, processed, strict=True):
                 expected_hash = hash_bytes(raw.data)
                 assert proc.hash == expected_hash
         finally:
@@ -137,9 +134,7 @@ class TestProcessChunks:
             stream = chunk_file_streaming(temp_path)
             processed = list(process_chunks(stream, batch_size=4, max_workers=4))
 
-            reconstructed = b"".join(
-                decompress(p.compressed_data) for p in processed
-            )
+            reconstructed = b"".join(decompress(p.compressed_data) for p in processed)
             assert reconstructed == content
         finally:
             os.unlink(temp_path)

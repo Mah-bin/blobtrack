@@ -1,0 +1,117 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: test (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.14 has no fastcdc wheel, so it is the interpreter where our own
+        # numba accelerator matters most. All versions must produce identical
+        # chunk boundaries.
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          # "speed" installs the numba accelerator. It is exercised on every
+          # version because the tests assert its chunk boundaries are
+          # byte-identical to the pure-Python reference.
+          python -m pip install -e ".[dev,speed]"
+
+      - name: Lint
+        run: python -m ruff check .
+
+      - name: Compile check
+        run: python -m compileall -q blobtrack
+
+      - name: Test (accelerated)
+        run: python -m pytest tests/ -v
+
+      # The same suite must pass on the pure-Python fallback, so a user who
+      # installs without the "speed" extra is not on a different product.
+      - name: Test without the accelerator
+        env:
+          BLOBTRACK_DISABLE_NUMBA: "1"
+        run: python -m pytest tests/ -q
+
+  verify-claims:
+    name: verify README claims
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      # The pure-Python path must work with no accelerator installed at all.
+      - name: Test with no accelerator
+        env:
+          BLOBTRACK_DISABLE_NUMBA: "1"
+        run: python -m pytest tests/ -q
+
+      # The README states a test count. Fail the build if it drifts, so the
+      # badge and the prose can never quietly become false.
+      - name: Test count matches README
+        run: |
+          set -euo pipefail
+          actual=$(python -m pytest tests/ --collect-only -q 2>/dev/null | tail -1 \
+                  | grep -oE '[0-9]+' | head -1)
+          claimed=$(grep -oE '[0-9]+ tests' README.md | head -1 | grep -oE '[0-9]+')
+          echo "collected: $actual, README claims: $claimed"
+          test "$actual" = "$claimed" || {
+            echo "::error::README says $claimed tests but $actual are collected. Update the README."
+            exit 1
+          }
+
+      # Every command the README documents must actually exist.
+      - name: Documented commands all exist
+        run: |
+          set -euo pipefail
+          help=$(blob --help)
+          for cmd in $(grep -oE 'blob [a-z]+ ' README.md | sort -u | awk '{print $2}'); do
+            echo "$help" | grep -qw "$cmd" || {
+              echo "::error::README mentions 'blob $cmd' but the CLI does not provide it"
+              exit 1
+            }
+          done
+
+      # An end-to-end smoke test through the real entry point.
+      - name: End-to-end smoke test
+        run: |
+          set -euo pipefail
+          work=$(mktemp -d)
+          cd "$work"
+          blob init
+          python -c "open('demo.bin','wb').write(b'A'*(3*1024*1024))"
+          blob add demo.bin
+          blob commit -m "first"
+          blob log
+          blob fsck
+          blob gc --dry-run
+          blob branch feature
+          blob migrate --dry-run
+          rm demo.bin
+          first=$(blob log | grep -oE '^[|] [0-9a-f]{12}' | head -1 | tr -d '| ')
+          blob checkout "${first:-none}"
+          test -s demo.bin
+          blob --version

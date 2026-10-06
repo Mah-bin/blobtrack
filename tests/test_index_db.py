@@ -2,9 +2,9 @@
 Unit tests for IndexDB (SQLite metadata database).
 """
 
-import time
-import pytest
 from pathlib import Path
+
+import pytest
 
 from blobtrack.storage.index_db import IndexDB, init_db
 
@@ -75,9 +75,27 @@ def test_chunk_operations(temp_db: IndexDB):
 
 def test_commit_lifecycle_and_refs(temp_db: IndexDB):
     chunk_mappings = [
-        {"file_path": "dataset.bin", "chunk_hash": "chk_1", "chunk_offset": 0, "chunk_length": 100, "chunk_order": 0},
-        {"file_path": "dataset.bin", "chunk_hash": "chk_2", "chunk_offset": 100, "chunk_length": 150, "chunk_order": 1},
-        {"file_path": "dataset.bin", "chunk_hash": "chk_3", "chunk_offset": 250, "chunk_length": 200, "chunk_order": 2},
+        {
+            "file_path": "dataset.bin",
+            "chunk_hash": "chk_1",
+            "chunk_offset": 0,
+            "chunk_length": 100,
+            "chunk_order": 0,
+        },
+        {
+            "file_path": "dataset.bin",
+            "chunk_hash": "chk_2",
+            "chunk_offset": 100,
+            "chunk_length": 150,
+            "chunk_order": 1,
+        },
+        {
+            "file_path": "dataset.bin",
+            "chunk_hash": "chk_3",
+            "chunk_offset": 250,
+            "chunk_length": 200,
+            "chunk_order": 2,
+        },
     ]
     tree_data = {"root": "merkle_root_v1", "files": ["dataset.bin"]}
 

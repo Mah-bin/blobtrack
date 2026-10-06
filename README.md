@@ -1,366 +1,375 @@
-# blobtrack — Content-Aware Binary Version Control System
+# blobtrack — Content-Aware Binary Version Control
 
-> A `git`-like CLI (`blob`) for **incremental versioning of massive binary files** (videos, AI datasets, 3D models) using **Content-Defined Chunking, SHA-256, Merkle Trees, and Delta Synchronization**.
+> A `git`-like CLI (`blob`) for **incremental versioning of massive binary files**
+> (videos, AI datasets, 3D models) using Content-Defined Chunking, SHA-256,
+> Merkle trees, and delta synchronization.
 
-![Python](https://img.shields.io/badge/python-3.10+-blue) ![Tests](https://img.shields.io/badge/tests-99_passed-brightgreen) ![Status](https://img.shields.io/badge/phase-5_done-green)
+[![Python](https://img.shields.io/badge/python-3.10+-blue)]()
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-**Problem:** `git` stores a full 20 GB binary copy on every change → 20 commits = 400 GB wasted.
-**Solution:** `blob` slices files into ~2 MB variable chunks, fingerprints each with SHA-256, and stores **only changed chunks**. A 20 GB edit becomes a ~40 MB delta.
-
----
-
-## Table of Contents
-
-1. [Overview](#1-overview)
-2. [Features](#2-features)
-3. [Installation](#3-installation)
-4. [Quick Start](#4-quick-start)
-5. [Usage](#5-usage)
-6. [Project Architecture](#6-project-architecture)
-7. [Project Structure](#7-project-structure)
-8. [Development Status](#8-development-status)
-9. [Testing](#9-testing)
-10. [Tech Stack](#10-tech-stack)
-11. [Documentation](#11-documentation)
-12. [Team Roles](#12-team-roles)
-13. [SDGs Addressed](#13-sdgs-addressed)
+**Status:** v0.2.0 · **210 tests passing** · CI runs lint + tests on Python 3.10–3.14
 
 ---
 
-## 1. Overview
+## 1. What problem this solves
 
-`blob` enables true incremental versioning of large binaries without wasting storage or bandwidth. The 4-step pipeline:
+Git stores a full copy of every changed file. Commit a 20 GB video twenty times
+and you have used 400 GB to store 20 GB of unique content.
+
+blobtrack slices files into ~2 MB variable-sized chunks, fingerprints each
+chunk with SHA-256, and stores each distinct chunk exactly once. A 1 KB edit
+inside a 20 GB file creates one new chunk, not a new 20 GB blob.
 
 ```
-1. CHUNK  → 2. FINGERPRINT → 3. COMPARE → 4. SYNC
-Slice file   SHA-256 hash    Merkle Tree   Store only
-into pieces  each chunk      old vs new    new chunks
-using CDC                                   (deduplicated)
+   CHUNK  ────────►  FINGERPRINT  ────────►  COMPARE  ────────►  STORE
+ slice with         SHA-256 per chunk     Merkle delta        only chunks
+ content-defined    so identical data     old vs new         not already
+ chunking           has one identity      so we move         present
 ```
 
-* **CHUNK:** Stream file in 64 MB buffers, slice via `fastcdc` into variable chunks (min 512 KB, avg 2 MB, max 8 MB). CDC ensures inserting 1 byte only affects nearby chunks.
-* **FINGERPRINT:** SHA-256 per chunk (64-char hex). Identical data = identical hash.
-* **COMPARE:** Merkle Tree built bottom-up from chunk hashes; top-down diff prunes identical subtrees.
-* **SYNC:** Only new/modified chunks compressed with Zstandard and stored in `.blobtrack/objects/`.
+### Why content-defined chunking
 
-## 2. Features
+Fixed-size chunking breaks on insertion. Add one byte to the front of a file
+and every boundary shifts, so every chunk changes and deduplication collapses
+to nothing.
 
-*   **Incremental:** 10 MB file change of 1 KB → only 1 new chunk stored (50% dedup for 2-chunk file, 99% for 5000-chunk file)
-*   **Deduplicated:** `has_chunk()` check prevents duplicate storage
-*   **Versioned:** `commit` snapshots with Merkle root + parent chain, delta `+1 -1 =1`
-*   **Reconstructable:** `checkout` restores exact bytes via `retrieve_chunk + decompress` + `chunk_order`, verified by `SHA-256`
-*   **Maintainable:** `log` shows history newest first, `gc` deletes only orphans not in `get_active_chunk_hashes()`
-*   **Streaming:** Never loads whole file into RAM (`chunk_file_streaming` + `process_chunks` batch 16, workers 8)
-*   **Atomic:** `LocalStore` writes via `tempfile + fsync + atomic move`, `IndexDB` WAL mode with `IF NOT EXISTS`
-*   **Remote sync:** `push` transfers only missing chunks + commits, `pull` fetches delta, zero-transfer on re-sync
-*   **8 CLI commands:** `blob init, add, commit, log, checkout, gc, push, pull` (all 8 fully implemented)
+blobtrack cuts where the *data* says to cut, using a rolling hash. Inserting
+bytes only disturbs the chunks around the insertion point; everything else
+keeps its identity. Limits are 512 KB min / 2 MB average / 8 MB max.
 
-## 3. Installation
+---
 
-**Prerequisites:** Python 3.10+, `pip`
+## 2. Quick start
 
 ```bash
-# Clone
 git clone https://github.com/Mah-bin/blobtrack.git
 cd blobtrack
 
-# Venv (recommended)
-py -m venv venv
-# Windows: venv\Scripts\activate
+python -m venv venv
+# Windows:  venv\Scripts\activate
 # Linux/Mac: source venv/bin/activate
 
-# Dependencies
-py -m pip install -r requirements.txt
-# fastcdc, zstandard, rich, pytest
-
-# Editable install (registers `blob` command)
-py -m pip install -e .
-
-# Verify
+pip install -e ".[dev]"     # registers the `blob` command
 blob --help
 ```
 
-> If `blob` not found: `$env:Path += ";C:\Users\Admin\AppData\Local\Programs\Python\Python314\Scripts"` (Windows)
-
-## 4. Quick Start
+### A complete session
 
 ```bash
 mkdir demo && cd demo
 blob init
-# Initialized empty blobtrack repository in ...\.blobtrack
 
-# Create a file, add and commit
-py -c "open('video.mp4','wb').write(b'A'*5242880 + b'B'*5242880)" # 10 MB
+# Create and track a 10 MB file (5 MB of 'A' then 5 MB of 'B')
+python -c "open('video.mp4','wb').write(b'A'*5242880 + b'B'*5242880)"
 blob add video.mp4
-# Added 'video.mp4' -> 2 chunks (2 new, 0 reused, 0.0% dedup) [10485760 -> 357 bytes compressed]
+# Added 'video.mp4' -> 2 chunks (2 new, 0 reused, 0.0% dedup)
+#   [10485760 -> 357 bytes compressed] in 0.1s
 
 blob commit -m "first version"
-# Committed ca6543a654c6 - 1 file(s), 2 chunks, root a57493c037eb... - "first version"
+# Committed ca6543a654c6 - 1 file(s), 2 chunks (2 new), root a57493c037eb...
+# branch main | parent - -> ca6543a654c6 in 0.2s
 
-# Modify 1KB, re-add and commit
-py -c "f=open('video.mp4','r+b'); f.seek(2097152); f.write(b'X'*1024); f.close()"
+# Modify 1 KB near the middle
+python -c "f=open('video.mp4','r+b'); f.seek(2097152); f.write(b'X'*1024); f.close()"
 blob add video.mp4
 # Added 'video.mp4' -> 2 chunks (1 new, 1 reused, 50.0% dedup)
+
 blob commit -m "second version"
-# Committed 01de1f33cb00 - 1 file(s), 2 chunks, root 54e9f75c1140... | delta: +1 -1 =1
+# | delta: +1 -0 =1        <- only the changed chunk is new
 
-# History and checkout
 blob log
-# +------------------+----------------+--------+---------------------+--------------+
-# | Hash             | Message        | Author | Date                | Parent       |
-# |------------------+----------------+--------+---------------------+--------------|
-# | 01de1f33cb00     | second version | -      | 2026-08-27 12:34:31 | ca6543a654c6 |
-# | ca6543a654c6     | first version  | -      | 2026-08-27 12:34:29 | -            |
-# +------------------+----------------+--------+---------------------+--------------+
-
-blob checkout ca6543a654c6
-# Checked out ca6543a654c6 - restored 1 file(s), 2 chunks, 10485760 bytes
-
-blob gc
-# Garbage collection: no orphan chunks found - all 0 orphans, 0 bytes freed
-
-# Push to a remote location
-blob push D:\backup\demo_remote
-# Push complete: Commits synced 2, Chunks transferred 3, Skipped 0
-
-# Pull into a different repo
-cd C:\other\clone
-blob init
-blob pull D:\backup\demo_remote
-# Pull complete: Commits synced 2, Chunks transferred 3
-blob checkout ca6543a654c6
-# Checked out ca6543a654c6 - restored 1 file(s), exact SHA-256 match
+blob fsck                  # verify every referenced chunk
+blob checkout ca6543a654c6 # restore; every chunk is SHA-256 verified
 ```
 
-## 5. Usage
+---
 
-### 5.1 Implemented Commands
+## 3. Commands
 
-| Command | Description | Example | Status |
-|---|---|---|---|
-| `blob --help` | Show all 8 commands | `blob --help` | ✅ |
-| `blob --version` | Show version `0.1.0` | `blob --version` | ✅ |
-| `blob init` | Create repo in current dir | `blob init` | ✅ Phase 1 |
-| `blob add <file>` | Chunk, compress, deduplicate, store | `blob add video.mp4` | ✅ Phase 2 |
-| `blob commit -m "msg"` | Snapshot current state with Merkle root + parent | `blob commit -m "v1"` | ✅ Phase 3 |
-| `blob log` | Show commit history newest first | `blob log` | ✅ Phase 4 |
-| `blob checkout <hash>` | Reconstruct files from commit (exact SHA-256 verified) | `blob checkout ca6543a6` | ✅ Phase 4 |
-| `blob gc` | Delete orphan chunks not in any commit | `blob gc` | ✅ Phase 4 |
-| `blob push <remote>` | Push delta chunks + commits to remote | `blob push D:\backup` | ✅ Phase 5 |
-| `blob pull <remote>` | Pull delta chunks + commits from remote | `blob pull D:\backup` | ✅ Phase 5 |
+| Command | What it does |
+|---|---|
+| `blob init` | Create a repository in the current directory |
+| `blob add <file>` | Chunk, hash, compress and store a file; reuse existing chunks |
+| `blob commit -m <msg>` | Snapshot every tracked file as an immutable commit |
+| `blob log` | Show history, newest first |
+| `blob checkout <ref>` | Restore a commit or branch; verifies every chunk |
+| `blob rm <path>` | Stop tracking a path (does **not** rewrite history) |
+| `blob fsck` | Verify integrity: missing and corrupt chunks. Exit 1 if broken |
+| `blob gc [--dry-run]` | Delete chunks no commit references |
+| `blob migrate [--dry-run]` | Move legacy flat chunks into the fan-out layout |
+| `blob branch [name] [-d]` | List branches, or create/delete one |
+| `blob switch <branch>` | Move the current branch pointer |
+| `blob merge <branch>` | Join two branches (fast-forward, or union) |
+| `blob push [remote]` | Delta-push commits and the chunks they need |
+| `blob pull [remote]` | Delta-pull; does not touch the working tree |
 
-**`blob init`:** Creates `.blobtrack/objects/`, `.blobtrack/commits/`, `.blobtrack/index.db` (WAL SQLite, `0o700`). Idempotent — second run: `Error: repository already initialized` (no delete).
+`blobtrack` is an alias for `blob`.
 
-**`blob add <file>`:**
-*   Validates repo exists (walk up parents hunting `.blobtrack/`) and file exists/is_file
-*   Streams via `chunk_file_streaming` → `process_chunks` → `has_chunk`/`store_chunk`/`record_chunk` → `register_file`
-*   Output: `Added 'rel/path' -> N chunks (new, reused, dedup% [uncompressed -> compressed])`
-*   Handles relative/absolute paths with spaces, empty files, missing files, directories — all controlled `Error:` + `exit 1`
+### Safety properties
 
-**`blob commit -m "msg"`:**
-*   Validates `message` non-empty and repo + tracked files exist (`list_files()` sorted posix)
-*   Re-chunks each tracked file via `chunk_file_streaming -> process_chunks`, collects `combined_hashes` ordered by file path + chunk index
-*   `build_tree(combined)` -> `root.hash` + `serialize_tree(root)` -> `merkle_root` + `tree_data`
-*   Parent: `get_latest_commit()` -> `parent_hash = latest.commit_hash` else `None` for first commit
-*   Commit hash: `hash_bytes(f"{merkle_root}:{message}:{timestamp}:{parent or ''}".encode())` deterministic
-*   Delta: `compute_delta(parent_tree,new_tree)` -> `| delta: +1 -1 =1` for logging
-*   Persists atomically via `IndexDB.save_commit(...,tree_data,file_chunk_mappings)` with `offset/length/order`
+These are enforced in code and covered by tests, not just documented:
 
-**`blob log`:**
-*   `IndexDB.list_commits()` `ORDER BY timestamp DESC` newest first
-*   Rich table `Hash[:12] | Message | Author | Date | Parent[:12]` or plain fallback
-*   Read-only, handles `No commits yet`
+- **A missing tracked file fails the commit.** blobtrack will not silently
+  drop a file from history. Delete the file, then `blob rm` it, then commit.
+- **`checkout` cannot write outside the repository.** Paths from the database
+  are treated as untrusted — absolute paths and `..` are rejected. This
+  matters because a remote can supply them via `pull`.
+- **Every chunk is verified before it is used.** Each chunk is named by the
+  SHA-256 of its uncompressed content, and `checkout` verifies that before
+  writing bytes to your disk.
+- **Output never lies.** Success messages print only after the durable write
+  succeeds. Errors go to stderr and exit non-zero. User text is never parsed
+  as markup.
+- **`fsck` is honest.** It verifies content, not just presence, and exits 1 if
+  anything is wrong — safe to use in CI.
 
-**`blob checkout <hash>`:**
-*   Validates `^[0-9a-f]{6,64}$`, resolves short prefix via `list_commits()` prefix search, `get_commit` exists else `commit not found`
-*   `get_commit_chunk_refs(hash)` grouped `file_path` sorted `chunk_order`, for each `LocalStore.retrieve_chunk` -> `packer.decompress` -> `tmpfile + atomic replace` via `Path.replace()` **Policy A** leaves untracked `c.txt` alone
-*   Verifies `len(decompressed)==chunk_length` and `expected_total vs actual`, handles `missing chunk -> Error required chunk ... missing` `1`
-*   Output: `Checked out <12> - restored N file(s), M chunks, total_bytes` + `Commit: "msg" parent -`
+---
 
-**`blob gc`:**
-*   `get_active_chunk_hashes()` (all `chunk_refs`) vs `list_chunks()` stored
-*   `get_orphan_chunks()` LEFT JOIN, `LocalStore.garbage_collect(active)` + `delete_chunk_records(orphans)` idempotent
-*   Reports `deleted N orphan(s) from objects, M DB record(s), freed X bytes. Active: N`
+## 4. How it works
 
-**Deduplication & Versioning Examples:**
-```bash
-blob add test.bin        # 240 KB (<512KB) -> 1 chunks (1 new)
-blob add test.bin        # same file -> 0 new 1 reused 100% (objects stay 1)
-blob commit -m "v1"      # first commit parent None root 01a19c
-blob commit -m "v2"      # same content -> same root 01a19c parent v1, delta +0
-# 10 MB 2-chunk file, patch 1KB at 2MB, add + commit -> 1 new 1 reused 50% delta +1 -1
-blob checkout v1         # restores exact original SHA-256
-blob gc                  # deletes only deadbeef orphan, preserves active
-
-# Remote sync (Phase 5)
-blob push D:\backup\remote  # transfers only new chunks, auto-inits remote
-blob push D:\backup\remote  # second push: "Everything up-to-date" (zero-transfer)
-# Clone: init → pull → checkout → exact SHA-256 match
-```
-
-**`blob push <remote>`:**
-*   Validates local repo, resolves remote path (relative or absolute), auto-creates remote `.blobtrack/` via `init_remote()`
-*   Delegates to `RemoteSync.push(remote, local_store, local_db)` — delta detection via `has_chunk()`, transfers only missing chunks
-*   Syncs commits oldest-to-newest, skips already-synced commits
-*   Reports: `Commits synced N, Chunks transferred M, Skipped K, Bytes, Throughput`
-*   Zero-transfer on repeat: `"Everything up-to-date"`
-
-**`blob pull <remote>`:**
-*   Validates local repo + remote `.blobtrack/objects/` exists, else controlled error with hint
-*   Delegates to `RemoteSync.pull(remote, local_store, local_db)` — fetches only missing chunks
-*   Does NOT modify working tree — user must `checkout` after pull
-*   Reports same stats table + hint: `"Use 'blob checkout <hash>' to restore a version"`
-
-> `push`/`pull` default to `"origin"` if no remote given. "origin" is a literal path, not a stored alias.
-
-## 6. Project Architecture
+### Layout on disk
 
 ```
-                         USER
-                           |
-                       blob command
-                           |
-                    ┌──────────────┐
-                     │  cli/main.py │  build_parser() -> 8 subcommands, main() dispatch (blob/blobtrack)
-                    └──────┬───────┘
-                           |
-                    ┌──────────────┐
-                    │cli/commands.py│  cmd_init() ✅ + cmd_add() ✅ + cmd_commit() ✅ + cmd_log() ✅ + cmd_checkout() ✅ + cmd_gc() ✅ + cmd_push() ✅ + cmd_pull() ✅
-                    └──────┬───────┘
-                           |
-              ┌────────────┴─────────────┐
-              ▼                          ▼
-       .blobtrack/                   Member 2: core/
-       ├── objects/ (LocalStore)     ├── chunker.py  chunk_file_streaming -> ChunkData
-       ├── commits/                  ├── hasher.py   process_chunks -> ProcessedChunk(hash,compressed)
-       └── index.db (IndexDB WAL)    └── packer.py   compress/decompress (zstd)
-                                    Member 3: core/
-                                    ├── merkle_tree.py build_tree/serialize_tree root.hash
-                                    └── differ.py compute_delta (positional prune)
-                                    Member 4: storage/
-                                    ├── index_db.py IndexDB (files/commits/chunks/chunk_refs, save_commit, get_active)
-                                    ├── local_store.py LocalStore (has_chunk/store_chunk/retrieve/garbage_collect atomic)
-                                    └── remote_sync.py RemoteSync (Phase 5)
+.blobtrack/
+├── objects/
+│   ├── .tmp/                      staging area for atomic writes
+│   └── ab/abcdef0123...           two-character fan-out, then full hash
+├── commits/                       reserved
+└── index.db                       SQLite (WAL): files, commits, chunks,
+                                   chunk_refs, refs, config, commit_parents
 ```
 
-**Member 1 (CLI & Integration Lead)** owns `cli/main.py`, `cli/commands.py`, `setup.py`, `README.md` and wires others — the glue.
+Chunks are stored **zstd-compressed** but **named by the SHA-256 of their
+uncompressed bytes**, which is what makes deduplication work across files,
+versions and repositories.
 
-## 7. Project Structure
+### Pipeline
 
-```
-blobtrack/
-├── blobtrack/
-│   ├── __init__.py
-│   ├── cli/
-│   │   ├── __init__.py
-│   │   ├── main.py          # Member 1 - argparse front door
-│   │   └── commands.py      # Member 1 - cmd_init + cmd_add + cmd_commit + log/checkout/gc
-│   ├── core/
-│   │   ├── __init__.py
-│   │   ├── chunker.py       # Member 2 - CDC 512KB/2MB/8MB
-│   │   ├── hasher.py        # Member 2 - SHA-256 + parallel + ProcessedChunk
-│   │   ├── packer.py        # Member 2 - Zstd
-│   │   ├── merkle_tree.py   # Member 3 - Merkle Tree
-│   │   └── differ.py        # Member 3 - delta diff
-│   └── storage/
-│       ├── __init__.py
-│       ├── index_db.py      # Member 4 - WAL SQLite
-│       ├── local_store.py   # Member 4 - atomic object store
-│       └── remote_sync.py   # Member 4 - delta push/pull
-├── tests/
-│   ├── test_chunker.py
-│   ├── test_hasher.py
-│   ├── test_cli.py          # Member 1 - CLI + add/commit/log/checkout/gc integration tests
-│   ├── test_remote_cli.py   # Member 1 - Phase 5 push/pull + round-trip + dedup tests (26 tests)
-│   ├── test_index_db.py     # Member 4
-│   ├── test_local_store.py
-│   └── test_remote_sync.py
-├── docs/
-│   ├── cli_documentation.txt
-│   ├── core_engine_documentation.txt
-│   ├── storage_documentation.md
-│   └── integration_contract.md
-├── requirements.txt
-├── setup.py
-└── README.md
-```
+1. **Chunk** — `chunk_file_streaming` yields one chunk at a time, holding a
+   single file handle open. Memory is flat regardless of file size.
+2. **Fingerprint and compress** — `process_chunks` hashes and compresses in a
+   thread pool, in batches of 16 across 8 workers, preserving order.
+3. **Deduplicate** — a chunk already in the store is never rewritten.
+4. **Snapshot** — `build_tree` produces a Merkle root over the ordered chunk
+   hashes of every tracked file. That root *is* the repository state.
+5. **Delta** — `compute_delta_by_set` reports which chunks are genuinely new.
 
-## 8. Development Status
+### Why the delta is set-based, not positional
 
-Incremental, each phase produces a working demo. Current branch: `cli/P5` at Phase 5, `main` at `60f6daf` until PR merged.
+A positional tree walk compares chunks by position. With content-defined
+chunking, inserting one chunk early shifts everything after it, so a
+positional diff reports thousands of changes where only one chunk is new.
 
-| Phase | What | Who Leads | Deliverable | Status |
-|---|---|---|---|---|
-| **1** | CLI skeleton + `init` + SHA-256 | Member 1+2 | `blob init` works, can hash any file | **DONE** |
-| **2** | CDC chunking + compression + local storage | Member 2+4 | `blob add` slices & stores deduplicated | **DONE** `cli/P2` |
-| **3** | Merkle Tree + delta diffing + `commit` | Member 3+1 | `blob commit` builds tree, detects changes, persists snapshot | **DONE** `cli/P3` |
-| **4** | History + `checkout` + `gc` | Member 1+4 | `log`/`checkout`/`gc` work - exact reconstruction, orphan GC | **DONE** `cli/P4` |
-| **5** | Remote `push`/`pull` delta sync | Member 1+4 | delta push/pull, dedup, round-trip, 99 tests | **DONE** `cli/P5` |
+Measured on a 2,001-chunk file with a single chunk inserted at the front:
 
-## 9. Testing
+| Method | Result |
+|---|---|
+| `compute_delta` (positional) | `+2001 -2001` — reports 4,002 changed chunks |
+| `compute_delta_by_set` (used) | `+1 -0` — correct |
+
+`push` and `pull` both use the set-based diff, walking from the newest commit
+the two sides already share. This is why `push` transfers only what is new
+rather than scanning every object ever written.
+
+### Performance
+
+Measured on a 24 MB file (CPython 3.14, where no `fastcdc` wheel exists):
+
+| Stage | Time | Share |
+|---|---|---|
+| Content-defined chunking | ~5.6 s | ~89% |
+| SHA-256 of every chunk | ~1.2 s | ~19% |
+| zstd level 3 | ~0.1 s | ~2% |
+
+Chunking dominates. `process_chunks` supports `needs_payload` so `commit` skips
+compression for chunks it already has, but on this interpreter that saves
+little because the pure-Python rolling hash holds the GIL and cannot be
+parallelized.
+
+### Making chunking fast
+
+Content-defined chunking is a sequential rolling hash: byte *n*'s hash depends
+on bytes *n−1, n−2, …*. That cannot be vectorized, so the **only** way to
+speed it up is to run it in compiled code. `fastcdc` publishes no compiled
+wheels on PyPI for any version, so its pure-Python implementation is what runs
+everywhere by default.
+
+blobtrack therefore ships its own accelerator:
 
 ```bash
-# All tests (99: 11 chunker + 30 cli + 26 remote_cli + 13 hasher + 6 index_db + 5 local_store + 2 remote_sync + 6 misc)
-py -m pytest tests/ -v
-
-# Compile check
-py -m compileall blobtrack
-
-# Manual Phase 1-5 acceptance (isolated C:\tmp)
-mkdir C:\tmp\verify; cd C:\tmp\verify
-blob init
-blob add test.bin        # 240KB -> 1 chunks (1 new)
-blob commit -m "v1"      # first commit parent None root 01a19c
-blob add test.bin
-blob commit -m "v2"      # second same file same root parent v1
-# Modify 1KB, add + commit -> delta +1 -1, new root 348a7d
-blob log                 # 2 commits newest first
-blob checkout <v1>       # restores exact original SHA-256
-blob gc                  # no orphans or deletes deadbeef orphan
-blob push D:\backup\repo  # transfers chunks + commits to remote
-# In a new clone:
-blob init
-blob pull D:\backup\repo  # fetches chunks + commits from remote
-blob checkout <v1>        # restores exact bytes, SHA-256 verified
-
-# Specific suites
-py -m pytest tests/test_hasher.py tests/test_chunker.py -v     # Member 2
-py -m pytest tests/test_index_db.py tests/test_local_store.py -v  # Member 4
-py -m pytest tests/test_cli.py -k "log or checkout or gc" -v   # Member 1 Phase 4
-py -m pytest tests/test_remote_cli.py -v                        # Member 1 Phase 5
+pip install blobtrack[speed]     # installs numba + numpy
 ```
 
-## 10. Tech Stack
+The `speed` extra JIT-compiles the **identical** algorithm, so chunk boundaries
+are byte-for-byte unchanged — verified by tests against `fastcdc`'s reference
+implementation on every Python version. Check which backend is active:
 
-| Component | Technology | Reason |
+```bash
+blob --version
+# blob 0.2.0 (chunking: numba (JIT compiled))
+```
+
+| Backend | When | Speed |
 |---|---|---|
-| Language | Python 3.10+ | Easy dev, C libs handle math |
-| CLI | `argparse` + `rich` | Built-in + beautiful output |
-| Chunking | `fastcdc` | CDC rolling-hash, variable chunks |
-| Hashing | `hashlib` SHA-256 | Cryptographic fingerprint |
-| Compression | `zstandard` | 4-5 GB/s decompress, high ratio |
-| Merkle | `hashlib` SHA-256 | Tree of chunk hashes, serialize JSON |
-| Diff | `differ.py` | Positional prune + by_set for push/pull |
-| DB | SQLite (WAL mode) | Zero-setup, ACID, concurrent |
-| Tests | `pytest` | Standard |
+| `numba` | `speed` extra installed | **~20x faster** |
+| `cython` | fastcdc's compiled accelerator is importable | fast |
+| `python` | default fallback | baseline |
 
-## 11. Documentation
+blobtrack works correctly on the pure-Python path; it is just slow, so the CLI
+says so once rather than leaving you to guess why.
 
-*   `docs/cli_documentation.txt` — `main.py`/`commands.py` `cmd_add` 8-step + `cmd_commit` 9-contract + `cmd_log/checkout/gc` Phase 4 flow
-*   `docs/core_engine_documentation.txt` — CDC, hashing, Merkle, differ
-*   `docs/storage_documentation.md` — `IndexDB`/`LocalStore` APIs
-*   `docs/integration_contract.md` — Member 2/3 confirmed, Member 4 validated, 14 contracts (Phase 3 + Phase 5 push/pull)
+### Two further optimizations
 
-## 12. Team Roles
+**Files up to 512 KB skip CDC entirely.** A file no larger than the minimum
+chunk size is always exactly one chunk, so the rolling hash has nothing to do.
+This is provably identical output, not an approximation — see
+`chunk_file_streaming`.
 
-| Member | Role | Files Owned |
-|---|---|---|
-| **1** | CLI & Integration Lead | `cli/main.py`, `cli/commands.py`, `setup.py`, `README.md` |
-| 2 | Chunking & Hashing Engine | `core/chunker.py`, `hasher.py`, `packer.py` |
-| 3 | Merkle Tree & Delta Diffing | `core/merkle_tree.py`, `differ.py` |
-| 4 | Storage, Database & Remote Sync | `storage/local_store.py`, `index_db.py`, `remote_sync.py` |
+**Chunk boundaries are cached by content hash.** CDC is deterministic, so a
+file whose SHA-256 has been seen before yields exactly the same boundaries. We
+hash the file (C speed) and consult the cache before paying for the rolling
+hash. Every subsequent `add` or `commit` of unchanged content therefore skips
+CDC completely.
 
-## 13. SDGs Addressed
+Measured on a 200 MB file with the `speed` extra installed:
 
-*   **SDG 9** Industry, Innovation & Infrastructure — foundational MLOps/data engineering infrastructure
-*   **SDG 12** Responsible Consumption & Production — eliminates terabytes of redundant storage and bandwidth, reducing cloud energy
+| Operation | Time |
+|---|---|
+| `blob add` (first time) | 3.8s |
+| `blob commit` (first time) | 2.8s |
+| `blob add` (same content again) | 2.6s |
+| `blob commit` (nothing changed) | 2.2s |
+| `blob add` after a 4 KB edit | 2.7s → **1 new chunk, 99% dedup** |
+
+Without the `speed` extra the first `add` of a 200 MB file takes ~4 minutes;
+with it, ~4 seconds.
+
+---
+
+## 5. Architecture
+
+```
+                    USER
+                      |
+                  blob command
+                      |
+        +-------------+-------------+
+        |                           |
+  cli/main.py                 cli/commands.py
+  (argparse, 14 subcommands)  (validation -> delegate -> report)
+        |                           |
+        +-------------+-------------+
+                      |
+     +----------------+-----------------+
+     |                |                 |
+ core/chunker   core/hasher      core/packer
+ fastcdc CDC    SHA-256 +        zstd level 3
+                thread pool
+     |
+ core/merkle_tree.py  build/serialize trees
+ core/differ.py       content delta
+ core/integrity.py    chunk verification
+     |
+ +---+------------------+------------------+
+ |                    |                  |
+ storage/paths.py  storage/local_store.py  storage/index_db.py
+ repo-root          content-addressed    SQLite metadata,
+ confinement        object store         commits, refs
+                    + legacy fallback
+                    |
+             storage/remote_sync.py
+             delta push / pull
+```
+
+Layering rule: `core/` knows nothing about storage; `storage/` knows nothing
+about the CLI. The CLI validates, delegates, and reports — it does not
+reimplement chunking, hashing, or storage.
+
+### Module map
+
+| File | Responsibility |
+|---|---|
+| `core/chunker.py` | Content-defined chunking; detects the fastcdc backend |
+| `core/hasher.py` | SHA-256, parallel compress pipeline, commit-hash derivation |
+| `core/packer.py` | zstd compress/decompress |
+| `core/merkle_tree.py` | Merkle tree construction and serialization |
+| `core/differ.py` | Positional and content-based deltas |
+| `core/integrity.py` | Chunk payload verification |
+| `storage/paths.py` | Path normalization and repository containment |
+| `storage/local_store.py` | Object store, fan-out layout, legacy fallback, migration |
+| `storage/index_db.py` | Schema, commits, files, chunks, refs, ancestry |
+| `storage/remote_sync.py` | Delta push and pull |
+| `cli/commands.py` | Command handlers |
+| `cli/main.py` | Argument parsing and dispatch |
+
+---
+
+## 6. Testing
+
+```bash
+pip install -e ".[dev]"
+pytest tests/ -v              # 210 tests
+ruff check .                  # lint
+python -m compileall blobtrack
+```
+
+| Suite | Covers |
+|---|---|
+| `test_chunker.py` | CDC boundaries, contiguity, determinism, round-trip |
+| `test_hasher.py` | SHA-256 correctness, order preservation, compression round-trip |
+| `test_merkle_delta.py` | Tree shape, serialization, and delta correctness |
+| `test_paths.py` | Traversal and absolute-path rejection |
+| `test_integrity.py` | Corruption, truncation, verification |
+| `test_store_layout.py` | Fan-out, legacy fallback, migration |
+| `test_index_db.py` | Schema, commits, refs, orphans, ancestry |
+| `test_local_store.py` | Object store basics and GC |
+| `test_remote_sync.py` | Delta push/pull unit behaviour |
+| `test_repo_commands.py` | rm, fsck, gc, migrate, branch, switch, merge |
+| `test_cli.py` | CLI surface and add/commit/log/checkout integration |
+| `test_remote_cli.py` | Push/pull integration and round-trips |
+
+The CI workflow additionally verifies that the test count in this README
+matches reality, that every documented command exists, and runs an end-to-end
+smoke test — so the documentation cannot drift away from the code.
+
+---
+
+## 7. Known limitations
+
+Stated plainly, because a system that hides its limits is harder to trust:
+
+- **`push`/`pull` are filesystem paths, not network transports.** There is no
+  SSH, HTTP, authentication, or encryption. A "remote" is a directory you
+  already trust.
+- **No file-level three-way merge.** `merge` unions files by content hash and
+  reports conflicts rather than resolving them, which is the right default for
+  binaries but is not a text merge.
+- **No `status`, `diff`, or `show` commands.** History is inspected via `log`.
+- **History is append-only.** There is no way to drop a commit or reclaim the
+  space its chunks occupied. `rm` untracks a path going forward; past commits
+  keep their chunks.
+- **`commit` still hashes every tracked file** to check the boundary cache,
+  which is fast (C speed) but still linear in repository size. Only the
+  expensive rolling hash is skipped for unchanged content.
+- **Chunking is O(file size) on a cold cache.** The first time a piece of
+  content is seen it must be chunked; that is inherent to CDC.
+- **No locking.** Two concurrent `blob add` on the same file can interleave
+  metadata writes. SQLite transactions keep the database consistent, but the
+  operations are not serialized at the CLI level.
+- **Single branch checkout is full-tree.** `checkout` writes every file in the
+  commit; there is no sparse or incremental checkout.
+
+---
+
+## 8. Team
+
+| Area | Module |
+|---|---|
+| Chunking, hashing, compression | `core/chunker.py`, `core/hasher.py`, `core/packer.py` |
+| Merkle trees, delta diffing | `core/merkle_tree.py`, `core/differ.py` |
+| Storage, database, remote sync | `storage/` |
+| CLI and integration | `cli/`, `pyproject.toml`, docs |
+
+## 9. License
+
+MIT — see [LICENSE](LICENSE).
